@@ -12,11 +12,65 @@ import (
 	"unsafe"
 )
 
+// Decision records one scheduling decision within a bubble.
+// Layout must match runtime.bubbleDecision exactly.
+type Decision struct {
+	Index         int32
+	ChosenBgid    uint32
+	ChosenSpawnPC uintptr
+	RunqSize      int32
+	RunqBgids     [16]uint32
+	Step          int32
+	WaitReason    uint8
+}
+
+// BubbleState describes the state of a bubble at a scheduling decision point.
+// Layout must match runtime.bubbleState exactly.
+type BubbleState struct {
+	Step         int32
+	RunnableN    int32
+	RunnableBgid [16]uint32
+	RunnableGlob [16]bool
+	Blocked      int32
+	Idle         bool
+	Now          int64
+	TimerCount   int32
+	NextTimer    int64
+}
+
 //go:linkname Run
 func Run(f func())
 
+// RunExplore runs f in a new bubble. If prefix is non-nil, the scheduler
+// follows those decisions before making its own. Returns the full trace.
+//
+//go:linkname RunExplore
+func RunExplore(f func(), prefix []Decision) []Decision
+
 //go:linkname Wait
 func Wait()
+
+// SetDecisionHook sets the onDecision hook for the current bubble.
+// The hook is called by the root goroutine at each frontier decision point.
+// Must be called from within a bubble.
+//
+//go:linkname SetDecisionHook
+func SetDecisionHook(fn func(BubbleState) int32)
+
+// MarkGlobal marks the current goroutine as global within its bubble.
+// Children of a global goroutine inherit the global flag.
+// When a global goroutine appears in the runq, the decision hook
+// receives Global=true in the corresponding GoroutineInfo.
+//
+//go:linkname MarkGlobal
+func MarkGlobal()
+
+// CallExternal marks the current goroutine as global and calls fn.
+// This is a convenience wrapper for MarkGlobal + fn().
+func CallExternal(fn func()) {
+	MarkGlobal()
+	fn()
+}
 
 // IsInBubble reports whether the current goroutine is in a bubble.
 //

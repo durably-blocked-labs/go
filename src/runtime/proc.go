@@ -755,6 +755,92 @@ const (
 	_GoidCacheBatch = 16
 )
 
+// bubblePreSnapshot captures the runnable set into the next decisions slot.
+// Must be called BEFORE the goroutine is removed from the runq (before runqget/runqpick).
+// The snapshot includes runnext (if any) followed by circular buffer entries.
+func bubblePreSnapshot(pp *p, b *synctestBubble) {
+	if b == nil || b.decisions == nil || b.decisionLen >= bubbleMaxDecisions {
+		return
+	}
+	d := &b.decisions[b.decisionLen]
+	pos := int32(0)
+	if next := pp.runnext; next != 0 {
+		d.runqBgids[pos] = next.ptr().bubbleGid
+		pos++
+	}
+	h := atomic.LoadAcq(&pp.runqhead)
+	t := pp.runqtail
+	for i := h; i < t && pos < bubbleMaxRunq; i++ {
+		d.runqBgids[pos] = pp.runq[i%uint32(len(pp.runq))].ptr().bubbleGid
+		pos++
+	}
+	d.runqSize = pos
+}
+
+// bubbleFinishRecord completes the decision record after a goroutine has been picked.
+// Must be called AFTER bubblePreSnapshot and AFTER runqget/runqpick.
+func bubbleFinishRecord(b *synctestBubble, gp *g, idx int32) {
+	if b == nil || b.decisions == nil {
+		return
+	}
+	n := b.decisionLen
+	if n >= bubbleMaxDecisions {
+		return
+	}
+	d := &b.decisions[n]
+	d.step = n
+	d.index = idx
+	d.chosenBgid = gp.bubbleGid
+	d.chosenSpawnPC = gp.bubbleSpawnPC
+	b.decisionLen = n + 1
+}
+
+// runqpick removes the n-th goroutine from pp's local run queue.
+// Position 0 is runnext (if populated), then circular buffer entries from head.
+// Returns nil if the position is out of range.
+// Must be called from the P's g0.
+func runqpick(pp *p, n int32) (*g, bool) {
+	// Position 0 = runnext if available.
+	if next := pp.runnext; next != 0 {
+		if n == 0 {
+			if !pp.runnext.cas(next, 0) {
+				return nil, false
+			}
+			return next.ptr(), true // inheritTime
+		}
+		n-- // runnext occupied position 0; adjust for circular buffer
+	}
+
+	// Now n indexes into the circular buffer.
+	h := atomic.LoadAcq(&pp.runqhead)
+	t := pp.runqtail
+	qLen := int32(t - h)
+
+	if n < 0 || n >= qLen {
+		return nil, false
+	}
+
+	if n == 0 {
+		// Optimize: just advance head (same as runqget's circular buffer path).
+		gp := pp.runq[h%uint32(len(pp.runq))].ptr()
+		if atomic.CasRel(&pp.runqhead, h, h+1) {
+			return gp, false
+		}
+		return nil, false
+	}
+
+	// Remove from middle: get the goroutine, shift tail entries left by 1.
+	idx := h + uint32(n)
+	gp := pp.runq[idx%uint32(len(pp.runq))].ptr()
+	for i := idx; i+1 < t; i++ {
+		pp.runq[i%uint32(len(pp.runq))].set(
+			pp.runq[(i+1)%uint32(len(pp.runq))].ptr())
+	}
+	pp.runqtail = t - 1
+
+	return gp, false
+}
+
 // cpuinit sets up CPU feature flags and calls internal/cpu.Initialize. env should be the complete
 // value of the GODEBUG environment variable.
 func cpuinit(env string) {
@@ -1134,7 +1220,15 @@ func ready(gp *g, traceskip int, next bool) {
 		trace.GoUnpark(gp, traceskip)
 		traceRelease(trace)
 	}
-	runqput(mp.p.ptr(), gp, next)
+	// Cross-P goready fix: if gp belongs to a bubble pinned to a different P,
+	// redirect it to the bubble's P. This happens when an external goroutine
+	// (e.g., orchestrator) sends on a channel to unblock a bubble goroutine.
+	pp := mp.p.ptr()
+	if gp.bubble != nil && gp.bubble.pp != nil && gp.bubble.pp != pp {
+		pp = gp.bubble.pp
+		next = false // don't displace runnext on a different P
+	}
+	runqput(pp, gp, next)
 	wakep()
 	releasem(mp)
 }
@@ -3415,7 +3509,8 @@ top:
 	now, pollUntil, _ := pp.timers.check(0, nil)
 
 	// Try to schedule the trace reader.
-	if traceEnabled() || traceShuttingDown() {
+	// Skip for bubble Ps: trace reader is not a bubble goroutine.
+	if pp.bubble == nil && (traceEnabled() || traceShuttingDown()) {
 		gp := traceReader()
 		if gp != nil {
 			trace := traceAcquire()
@@ -3429,7 +3524,8 @@ top:
 	}
 
 	// Try to schedule a GC worker.
-	if gcBlackenEnabled != 0 {
+	// Skip for bubble Ps: GC workers are not bubble goroutines.
+	if gcBlackenEnabled != 0 && pp.bubble == nil {
 		gp, tnow := gcController.findRunnableGCWorker(pp, now)
 		if gp != nil {
 			return gp, false, true
@@ -3440,7 +3536,8 @@ top:
 	// Check the global runnable queue once in a while to ensure fairness.
 	// Otherwise two goroutines can completely occupy the local runqueue
 	// by constantly respawning each other.
-	if pp.schedtick%61 == 0 && !sched.runq.empty() {
+	// Skip for bubble Ps: bubble goroutines must stay on this P.
+	if pp.bubble == nil && pp.schedtick%61 == 0 && !sched.runq.empty() {
 		lock(&sched.lock)
 		gp := globrunqget()
 		unlock(&sched.lock)
@@ -3450,14 +3547,16 @@ top:
 	}
 
 	// Wake up the finalizer G.
-	if fingStatus.Load()&(fingWait|fingWake) == fingWait|fingWake {
+	// Skip for bubble Ps: ready() would put finalizer on bubble P's runq.
+	if pp.bubble == nil && fingStatus.Load()&(fingWait|fingWake) == fingWait|fingWake {
 		if gp := wakefing(); gp != nil {
 			ready(gp, 0, true)
 		}
 	}
 
 	// Wake up one or more cleanup Gs.
-	if gcCleanups.needsWake() {
+	// Skip for bubble Ps: same reason as finalizer.
+	if pp.bubble == nil && gcCleanups.needsWake() {
 		gcCleanups.wake()
 	}
 
@@ -3465,13 +3564,87 @@ top:
 		asmcgocall(*cgo_yield, nil)
 	}
 
+	// Bubble: decision-ready — root has decided, pick the chosen goroutine.
+	if b := pp.bubble; b != nil && b.decisionReady {
+		b.decisionReady = false
+		bubblePreSnapshot(pp, b)
+		gp, inheritTime := runqpick(pp, b.decidedIndex)
+		if gp != nil {
+			bubbleFinishRecord(b, gp, b.decidedIndex)
+			return gp, inheritTime, false
+		}
+		// runqpick failed — fall through to normal path.
+	}
+
+	// Bubble: follow pre-loaded decisions before default runqget.
+	if b := pp.bubble; b != nil && b.decisions != nil && b.decisionLen < b.decisionFence {
+		d := &b.decisions[b.decisionLen] // pre-loaded decision at current step
+		bubblePreSnapshot(pp, b)
+		gp, inheritTime := runqpick(pp, d.index)
+		if gp != nil {
+			bubbleFinishRecord(b, gp, d.index)
+			return gp, inheritTime, false
+		}
+		// runqpick failed (runq empty — expected goroutine not yet runnable).
+		// Fall through to normal path without recording anything.
+		// The normal path's bubblePreSnapshot will overwrite the partial snapshot.
+	}
+
+	// Bubble: frontier — past pre-loaded decisions, hook wants to decide.
+	// Wake root goroutine so it can call the onDecision hook.
+	if b := pp.bubble; b != nil && b.decisions != nil &&
+		b.decisionLen >= b.decisionFence && b.onDecision != nil && !runqempty(pp) &&
+		!b.rootInHook {
+		// Only wake root if it's actually parked and not currently in the hook.
+		// rootInHook is true when the hook is blocking (e.g., waiting for
+		// orchestrator response). In that case, skip — root will return from
+		// the hook eventually and set decisionReady.
+		if readgstatus(b.root)&^_Gscan == _Gwaiting {
+			// Snapshot runq for root to inspect.
+			pos := int32(0)
+			if next := pp.runnext; next != 0 {
+				gp := next.ptr()
+				b.pendingRunq[pos] = gp.bubbleGid
+				b.pendingGlob[pos] = gp.bubbleGlobal
+				pos++
+			}
+			h := atomic.LoadAcq(&pp.runqhead)
+			t := pp.runqtail
+			for i := h; i < t && pos < bubbleMaxRunq; i++ {
+				gp := pp.runq[i%uint32(len(pp.runq))].ptr()
+				b.pendingRunq[pos] = gp.bubbleGid
+				b.pendingGlob[pos] = gp.bubbleGlobal
+				pos++
+			}
+			b.pendingSize = pos
+			b.signal = bubbleSignalNeedDecision
+
+			// Maintain active count so synctestidle_c parks correctly.
+			lock(&b.mu)
+			b.active++
+			unlock(&b.mu)
+
+			// Wake root by making it runnable and returning it.
+			casgstatus(b.root, _Gwaiting, _Grunnable)
+			return b.root, false, false
+		}
+		// Root already awake — fall through to normal path.
+	}
+
 	// local runq
+	if b := pp.bubble; b != nil {
+		bubblePreSnapshot(pp, b)
+	}
 	if gp, inheritTime := runqget(pp); gp != nil {
+		if b := pp.bubble; b != nil {
+			bubbleFinishRecord(b, gp, 0)
+		}
 		return gp, inheritTime, false
 	}
 
 	// global runq
-	if !sched.runq.empty() {
+	// Skip for bubble Ps: bubble goroutines must stay local.
+	if pp.bubble == nil && !sched.runq.empty() {
 		lock(&sched.lock)
 		gp, q := globrunqgetbatch(int32(len(pp.runq)) / 2)
 		unlock(&sched.lock)
@@ -3828,6 +4001,11 @@ func pollWork() bool {
 func stealWork(now int64) (gp *g, inheritTime bool, rnow, pollUntil int64, newWork bool) {
 	pp := getg().m.p.ptr()
 
+	// Bubble Ps don't steal: all their goroutines are local.
+	if pp.bubble != nil {
+		return nil, false, now, 0, false
+	}
+
 	ranTimer := false
 
 	const stealTries = 4
@@ -3841,6 +4019,10 @@ func stealWork(now int64) (gp *g, inheritTime bool, rnow, pollUntil int64, newWo
 			}
 			p2 := allp[enum.position()]
 			if pp == p2 {
+				continue
+			}
+			// Don't steal from bubble Ps — their goroutines must stay local.
+			if p2.bubble != nil {
 				continue
 			}
 
@@ -4332,6 +4514,10 @@ func goschedImpl(gp *g, preempted bool) {
 		// If preempted for STW, keep the G on the local P in runnext
 		// so it can keep running immediately after the STW.
 		runqput(pp, gp, true)
+	} else if gp.bubble != nil {
+		// Bubble goroutines must stay on their bubble P.
+		// Don't put them on the global runq where other Ps could steal them.
+		runqput(pp, gp, false)
 	} else {
 		lock(&sched.lock)
 		globrunqput(gp)
@@ -5360,6 +5546,11 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 	} else {
 		// Only user goroutines inherit synctest groups and pprof labels.
 		newg.bubble = callergp.bubble
+		if newg.bubble != nil {
+			newg.bubbleGid = atomic.Xadd(&newg.bubble.nextGid, 1)
+			newg.bubbleSpawnPC = callerpc
+			newg.bubbleGlobal = callergp.bubbleGlobal // children inherit global flag
+		}
 		if mp.curg != nil {
 			newg.labels = mp.curg.labels
 		}
@@ -7522,6 +7713,12 @@ retry:
 // Put g and a batch of work from local runnable queue on global queue.
 // Executed only by the owner P.
 func runqputslow(pp *p, gp *g, h, t uint32) bool {
+	// Bubble Ps must not overflow goroutines to the global runq.
+	// If we hit this, the bubble has >256 runnable goroutines — not supported (single-P limit).
+	if pp.bubble != nil {
+		throw("synctest bubble: runq overflow (too many runnable goroutines for single-P bubble)")
+	}
+
 	var batch [len(pp.runq)/2 + 1]*g
 
 	// First, grab a batch from local queue.

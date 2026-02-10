@@ -271,10 +271,21 @@ import (
 	_ "unsafe" // for linkname
 )
 
+// Decision is a scheduling decision recorded within a bubble.
+type Decision = synctest.Decision
+
+// BubbleState describes the state of a bubble at a scheduling decision point.
+type BubbleState = synctest.BubbleState
+
 // Test executes f in a new bubble.
 //
 // Test waits for all goroutines in the bubble to exit before returning.
 // If the goroutines in the bubble become deadlocked, the test fails.
+// Returns the full scheduling trace (all decisions made during execution).
+//
+// If prefix is provided, the scheduler follows those decisions before
+// making its own choices. Each call to Test creates a new bubble
+// (a new interleaving exploration).
 //
 // Test must not be called from within a bubble.
 //
@@ -285,20 +296,75 @@ import (
 //   - T.Context returns a [context.Context] with a Done channel
 //     associated with the bubble.
 //   - T.Run, T.Parallel, and T.Deadline must not be called.
-func Test(t *testing.T, f func(*testing.T)) {
+func Test(t *testing.T, f func(*testing.T), prefix ...[]Decision) []Decision {
+	var pfx []Decision
+	if len(prefix) > 0 {
+		pfx = prefix[0]
+	}
 	var ok bool
-	synctest.Run(func() {
+	trace := synctest.RunExplore(func() {
 		ok = testingSynctestTest(t, f)
-	})
+	}, pfx)
 	if !ok {
 		// Fail the test outside the bubble,
 		// so test durations get set using real time.
 		t.FailNow()
 	}
+	return trace
 }
 
 //go:linkname testingSynctestTest testing/synctest.testingSynctestTest
 func testingSynctestTest(t *testing.T, f func(*testing.T)) bool
+
+// Explore executes f in a new bubble with the given prefix and returns
+// the scheduling trace and whether the test passed.
+// Unlike Test, Explore does not call t.FailNow() on failure,
+// allowing the caller (e.g., an explorer) to handle failures.
+// If the bubble panics (e.g., deadlock), returns (nil, false).
+func Explore(t *testing.T, f func(*testing.T), prefix []Decision) (trace []Decision, ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			ok = false
+		}
+	}()
+	var innerOK bool
+	trace = synctest.RunExplore(func() {
+		innerOK = testingSynctestTest(t, f)
+	}, prefix)
+	ok = innerOK
+	return
+}
+
+// SetDecisionHook registers a function that is called at each frontier
+// scheduling decision point within the current bubble. The hook receives
+// the bubble state (runnable goroutines, blocked count, fake time, etc.)
+// and returns the index of the goroutine to schedule next (0 = FIFO default).
+//
+// SetDecisionHook must be called from within a bubble.
+// Passing nil restores the default FIFO scheduling.
+func SetDecisionHook(hook func(BubbleState) int32) {
+	synctest.SetDecisionHook(hook)
+}
+
+// MarkGlobal marks the current goroutine as global within its bubble.
+// Children of a global goroutine inherit the global flag.
+// When a global goroutine appears in the runq, the decision hook
+// receives Global=true in the corresponding GoroutineInfo, allowing
+// the orchestrator to distinguish local vs. cross-node decisions.
+//
+// MarkGlobal must be called from within a bubble.
+func MarkGlobal() {
+	synctest.MarkGlobal()
+}
+
+// CallExternal marks the current goroutine as global and calls fn.
+// Use this to wrap RPC calls or other external operations so that
+// their scheduling decisions are forwarded to the orchestrator.
+//
+// CallExternal must be called from within a bubble.
+func CallExternal(fn func()) {
+	synctest.CallExternal(fn)
+}
 
 // Wait blocks until every goroutine within the current bubble,
 // other than the current goroutine, is durably blocked.

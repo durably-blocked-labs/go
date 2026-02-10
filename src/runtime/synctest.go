@@ -10,6 +10,54 @@ import (
 	"unsafe"
 )
 
+// bubbleMaxDecisions is the maximum number of scheduling decisions
+// that can be recorded per bubble. Allocated via persistentalloc.
+const bubbleMaxDecisions = 512
+
+// bubbleMaxRunq is the maximum number of runnable goroutines tracked
+// in a single scheduling decision snapshot.
+const bubbleMaxRunq = 16
+
+// bubbleDecision records one scheduling decision within a bubble.
+// At each yield point (call to schedule()), the scheduler records which
+// goroutine was picked and what the runnable set looked like.
+type bubbleDecision struct {
+	// The decision: which goroutine to pick from the runq.
+	index int32 // index into the runnable set (0 = runnext or head)
+
+	// Observability: identity of the chosen goroutine.
+	chosenBgid    uint32  // bubble-local goroutine ID (deterministic)
+	chosenSpawnPC uintptr // PC of the "go" statement that created it
+
+	// Observability: state of the runnable set at this decision point.
+	runqSize  int32              // total runnable goroutines (including chosen)
+	runqBgids [bubbleMaxRunq]uint32 // bubble gids of all runnable goroutines
+
+	// Context.
+	step       int32 // sequence number within this bubble
+	waitReason uint8 // why the previous goroutine yielded (waitReason enum)
+}
+
+// bubbleState is the state passed to the onDecision hook at frontier decision points.
+// Layout must match internal/synctest.BubbleState exactly (used across go:linkname).
+type bubbleState struct {
+	step         int32
+	runnableN    int32
+	runnableBgid [bubbleMaxRunq]uint32
+	runnableGlob [bubbleMaxRunq]bool
+	blocked      int32
+	idle         bool
+	now          int64
+	timerCount   int32
+	nextTimer    int64
+}
+
+// Signal types for communication between findRunnable (g0) and root goroutine.
+const (
+	bubbleSignalNone         = 0
+	bubbleSignalNeedDecision = 1
+)
+
 // A synctestBubble is a set of goroutines started by synctest.Run.
 type synctestBubble struct {
 	mu      mutex
@@ -36,6 +84,49 @@ type synctestBubble struct {
 	total   int // total goroutines
 	running int // non-blocked goroutines
 	active  int // other sources of activity
+
+	// Deterministic goroutine IDs within this bubble.
+	// Assigned sequentially as goroutines are created.
+	nextGid uint32
+
+	// Decision tracking (unified model).
+	// decisions[0..decisionLen-1] is the recorded trace so far.
+	// decisionLen is both the step counter and the next write slot.
+	// If decisionFence > 0, pre-loaded decisions exist in decisions[0..decisionFence-1].
+	// When decisionLen < decisionFence, findRunnable follows the pre-loaded decision
+	// (using its index field) instead of default FIFO. At the frontier
+	// (decisionLen >= decisionFence), the root goroutine is woken to decide.
+	// Either way, the actual decision is always recorded at decisions[decisionLen].
+	// Allocated via persistentalloc (not GC-managed, contains no pointers).
+	decisions     *[bubbleMaxDecisions]bubbleDecision
+	decisionLen   int32 // decisions recorded so far (= step counter)
+	decisionFence int32 // pre-loaded decisions boundary (0 = no pre-load)
+
+	// Signaling between findRunnable (g0) and root goroutine.
+	// When findRunnable reaches the frontier and the runq is non-empty,
+	// it snapshots the runq into pendingRunq, sets signal = needDecision,
+	// and wakes root. Root reads the snapshot, decides, writes decidedIndex,
+	// sets decisionReady = true, and goparks. findRunnable picks the chosen goroutine.
+	signal        uint32
+	decisionReady bool
+	decidedIndex  int32
+	pendingRunq   [bubbleMaxRunq]uint32 // runq snapshot (bubble gids)
+	pendingGlob   [bubbleMaxRunq]bool   // runq snapshot (global flags)
+	pendingSize   int32
+
+	// The P this bubble is pinned to. Set once in synctestRunImpl.
+	// Used by ready() to route woken bubble goroutines back to the right P.
+	pp *p
+
+	// rootInHook is true while the root goroutine is executing the onDecision hook.
+	// When set, findRunnable must not try to wake root again (the hook may block,
+	// e.g., waiting for an orchestrator response on a channel).
+	rootInHook bool
+
+	// Orchestrator hooks, set before synctestRun by the orchestrator.
+	// Called by the root goroutine from the synctestRun control loop.
+	// nil = default behavior (FIFO, index 0).
+	onDecision func(bubbleState) int32
 }
 
 // changegstatus is called when the non-lock status of a g changes.
@@ -169,6 +260,15 @@ var bubbleGen atomic.Uint64 // bubble ID counter
 
 //go:linkname synctestRun internal/synctest.Run
 func synctestRun(f func()) {
+	synctestRunImpl(f, nil)
+}
+
+//go:linkname synctestRunExplore internal/synctest.RunExplore
+func synctestRunExplore(f func(), prefix []bubbleDecision) []bubbleDecision {
+	return synctestRunImpl(f, prefix)
+}
+
+func synctestRunImpl(f func(), prefix []bubbleDecision) []bubbleDecision {
 	if debug.asynctimerchan.Load() != 0 {
 		panic("synctest.Run not supported with asynctimerchan!=0")
 	}
@@ -188,9 +288,35 @@ func synctestRun(f func()) {
 	lockInit(&bubble.mu, lockRankSynctest)
 	lockInit(&bubble.timers.mu, lockRankTimers)
 
+	// Allocate the decisions array via persistentalloc (non-GC, no pointers inside).
+	bubble.decisions = (*[bubbleMaxDecisions]bubbleDecision)(
+		persistentalloc(unsafe.Sizeof([bubbleMaxDecisions]bubbleDecision{}), 0, &memstats.other_sys))
+
+	// Load prefix into the decisions array before any goroutine runs.
+	if len(prefix) > 0 {
+		n := int32(len(prefix))
+		if n > bubbleMaxDecisions {
+			n = bubbleMaxDecisions
+		}
+		for i := int32(0); i < n; i++ {
+			bubble.decisions[i] = prefix[i]
+		}
+		bubble.decisionFence = n
+	}
+
 	gp.bubble = bubble
+	gp.bubbleGid = 0 // root goroutine is B0
+	gp.bubbleSpawnPC = sys.GetCallerPC()
+
+	// Pin this P to the bubble so findRunnable can follow/record decisions.
+	// bubble.pp is the reverse pointer used by ready() to route woken goroutines.
+	pp := gp.m.p.ptr()
+	pp.bubble = bubble
+	bubble.pp = pp
 	defer func() {
 		gp.bubble = nil
+		pp.bubble = nil
+		bubble.pp = nil
 	}()
 
 	// This is newproc, but also records the new g in bubble.main.
@@ -216,6 +342,34 @@ func synctestRun(f func()) {
 			gp.m.curg = curg
 		})
 		gopark(synctestidle_c, nil, waitReasonSynctestRun, traceBlockSynctest, 0)
+
+		// Handle frontier decision signal before locking.
+		// findRunnable woke us because it needs a scheduling decision.
+		if bubble.signal == bubbleSignalNeedDecision {
+			bubble.signal = bubbleSignalNone
+			idx := int32(0) // default FIFO
+			if bubble.onDecision != nil {
+				state := bubbleState{
+					step:      bubble.decisionLen,
+					runnableN: bubble.pendingSize,
+					blocked:   int32(bubble.total - bubble.running),
+					now:       bubble.now,
+					nextTimer: bubble.timers.wakeTime(),
+				}
+				for i := int32(0); i < bubble.pendingSize && i < bubbleMaxRunq; i++ {
+					state.runnableBgid[i] = bubble.pendingRunq[i]
+					state.runnableGlob[i] = bubble.pendingGlob[i]
+				}
+				bubble.rootInHook = true
+				idx = bubble.onDecision(state)
+				bubble.rootInHook = false
+			}
+			bubble.decidedIndex = idx
+			bubble.decisionReady = true
+			lock(&bubble.mu)
+			continue // back to top → unlock → timer check → gopark → findRunnable sees decisionReady
+		}
+
 		lock(&bubble.mu)
 		if bubble.active < 0 {
 			throw("active < 0")
@@ -255,6 +409,17 @@ func synctestRun(f func()) {
 		// This could happen if something in Run were to call timeSleep.
 		throw("synctest root goroutine has a fake timer")
 	}
+
+	// Copy trace out of the bubble (persistentalloc memory → GC-managed slice).
+	n := bubble.decisionLen
+	if n > 0 {
+		trace := make([]bubbleDecision, n)
+		for i := int32(0); i < n; i++ {
+			trace[i] = bubble.decisions[i]
+		}
+		return trace
+	}
+	return nil
 }
 
 type synctestDeadlockError struct {
@@ -354,6 +519,79 @@ func synctest_inBubble(bubble any, f func()) {
 		gp.bubble = nil
 	}()
 	f()
+}
+
+// synctestMarkGlobal marks the current goroutine as global within its bubble.
+// Children of a global goroutine inherit the global flag.
+// Must be called from within a bubble.
+//
+//go:linkname synctestMarkGlobal internal/synctest.MarkGlobal
+func synctestMarkGlobal() {
+	gp := getg()
+	if gp.bubble == nil {
+		return
+	}
+	gp.bubbleGlobal = true
+}
+
+// synctestGetDecisions returns a copy of the current bubble's decisions.
+// Must be called from within a bubble.
+//
+//go:linkname synctestGetDecisions
+func synctestGetDecisions() []bubbleDecision {
+	gp := getg()
+	if gp.bubble == nil || gp.bubble.decisions == nil {
+		return nil
+	}
+	b := gp.bubble
+	n := b.decisionLen
+	if b.decisionFence > n {
+		n = b.decisionFence // include pre-loaded decisions not yet followed
+	}
+	if n <= 0 {
+		return nil
+	}
+	result := make([]bubbleDecision, n)
+	for i := int32(0); i < n; i++ {
+		result[i] = b.decisions[i]
+	}
+	return result
+}
+
+// synctestSetDecisions pre-loads decisions into the current bubble.
+// Must be called from within a bubble before any goroutines have started executing.
+// Sets decisionIdx to 0 so findRunnable will follow these decisions.
+//
+//go:linkname synctestSetDecisions
+func synctestSetDecisions(decisions []bubbleDecision) {
+	gp := getg()
+	if gp.bubble == nil || gp.bubble.decisions == nil {
+		return
+	}
+	b := gp.bubble
+	n := int32(len(decisions))
+	if n > bubbleMaxDecisions {
+		n = bubbleMaxDecisions
+	}
+	for i := int32(0); i < n; i++ {
+		b.decisions[i] = decisions[i]
+	}
+	b.decisionFence = n
+	// decisionLen is NOT reset — it tracks the current step.
+	// The follow code uses decisions[decisionLen].index when decisionLen < fence.
+}
+
+// synctestSetDecisionHook sets the onDecision hook for the current bubble.
+// The hook is called by the root goroutine at each frontier decision point.
+// Must be called from within a bubble.
+//
+//go:linkname synctestSetDecisionHook internal/synctest.SetDecisionHook
+func synctestSetDecisionHook(fn func(bubbleState) int32) {
+	gp := getg()
+	if gp.bubble == nil {
+		return
+	}
+	gp.bubble.onDecision = fn
 }
 
 // specialBubble is a special used to associate objects with bubbles.

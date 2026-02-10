@@ -574,6 +574,13 @@ type g struct {
 	coroarg *coro // argument during coroutine transfers
 	bubble  *synctestBubble
 
+	// Deterministic bubble-local goroutine ID and spawn location.
+	// bubbleGid is assigned sequentially within a bubble (0 = entrypoint).
+	// bubbleSpawnPC is the PC of the "go" statement that created this goroutine.
+	bubbleGid     uint32
+	bubbleSpawnPC uintptr
+	bubbleGlobal  bool // true if marked as global (scheduling decisions forwarded to orchestrator)
+
 	// xRegs stores the extended register state if this G has been
 	// asynchronously preempted.
 	xRegs xRegPerG
@@ -817,6 +824,11 @@ type p struct {
 	// Note that while other P's may atomically CAS this to zero,
 	// only the owner P can CAS it to a valid G.
 	runnext guintptr
+
+	// bubble is non-nil when this P is dedicated to a synctest bubble.
+	// Set in synctestRun, cleared on exit. Used by findRunnable to
+	// follow/record scheduling decisions.
+	bubble *synctestBubble
 
 	// Available G's (status == Gdead)
 	gFree gList
