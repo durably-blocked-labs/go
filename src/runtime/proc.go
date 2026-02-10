@@ -1226,7 +1226,24 @@ func ready(gp *g, traceskip int, next bool) {
 	pp := mp.p.ptr()
 	if gp.bubble != nil && gp.bubble.pp != nil && gp.bubble.pp != pp {
 		pp = gp.bubble.pp
-		next = false // don't displace runnext on a different P
+		// When waking root during rootInHook (orchestrator responded on channel),
+		// use runnext so findRunnable can pick it up immediately without scanning
+		// the circular buffer. For other bubble goroutines, don't displace runnext.
+		if gp == gp.bubble.root && gp.bubble.rootInHook {
+			next = true
+		} else {
+			next = false // don't displace runnext on a different P
+		}
+	} else if gp.bubble == nil && pp.bubble != nil {
+		// Non-bubble goroutine woken from bubble context (e.g., bubble root sends
+		// on channel to orchestrator). Don't strand it on the bubble's P — the
+		// rootInHook pause would prevent it from running. Use global runq instead.
+		lock(&sched.lock)
+		globrunqput(gp)
+		unlock(&sched.lock)
+		wakep()
+		releasem(mp)
+		return
 	}
 	runqput(pp, gp, next)
 	wakep()
@@ -3629,6 +3646,26 @@ top:
 			return b.root, false, false
 		}
 		// Root already awake — fall through to normal path.
+	}
+
+	// Bubble: hook is blocking on external I/O — pause the bubble.
+	// When rootInHook is true, the root goroutine is executing the onDecision
+	// hook, which is blocking (e.g., waiting for orchestrator response on a
+	// channel). User goroutines must not run until the hook returns a decision.
+	// Only pick root from runnext so it can finish the hook and set decisionReady.
+	//
+	// We use a tight inner loop instead of goto top to avoid gcstopm releasing
+	// the bubble P during GC (which would orphan it). The spin is brief — the
+	// orchestrator typically responds within microseconds via a channel.
+	if b := pp.bubble; b != nil && b.rootInHook {
+		for {
+			if next := pp.runnext; next != 0 && next.ptr() == b.root {
+				if pp.runnext.cas(next, 0) {
+					return b.root, true, false
+				}
+			}
+			osyield()
+		}
 	}
 
 	// local runq

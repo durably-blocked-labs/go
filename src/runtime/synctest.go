@@ -310,7 +310,29 @@ func synctestRunImpl(f func(), prefix []bubbleDecision) []bubbleDecision {
 
 	// Pin this P to the bubble so findRunnable can follow/record decisions.
 	// bubble.pp is the reverse pointer used by ready() to route woken goroutines.
+	// If the current P already has a bubble (e.g., multiple bubbles spawned from
+	// the same goroutine land on the same P), acquire a free P first.
 	pp := gp.m.p.ptr()
+	if pp.bubble != nil {
+		systemstack(func() {
+			oldpp := releasep()
+			// Don't use pidleput — the old P has goroutines on its runq.
+			// handoffp starts a new M for it so those goroutines keep running.
+			handoffp(oldpp)
+			// Acquire a fresh idle P for our bubble.
+			lock(&sched.lock)
+			newpp, _ := pidlegetSpinning(0)
+			if newpp == nil {
+				newpp, _ = pidleget(0)
+			}
+			unlock(&sched.lock)
+			if newpp == nil {
+				throw("synctest: no idle P available for new bubble")
+			}
+			acquirep(newpp)
+		})
+		pp = gp.m.p.ptr()
+	}
 	pp.bubble = bubble
 	bubble.pp = pp
 	defer func() {
