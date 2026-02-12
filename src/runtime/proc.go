@@ -792,6 +792,7 @@ func bubbleFinishRecord(b *synctestBubble, gp *g, idx int32) {
 	d.index = idx
 	d.chosenBgid = gp.bubbleGid
 	d.chosenSpawnPC = gp.bubbleSpawnPC
+	b.lastScheduledBgid = gp.bubbleGid
 	b.decisionLen = n + 1
 }
 
@@ -1223,18 +1224,24 @@ func ready(gp *g, traceskip int, next bool) {
 	// Cross-P goready fix: if gp belongs to a bubble pinned to a different P,
 	// redirect it to the bubble's P. This happens when an external goroutine
 	// (e.g., orchestrator) sends on a channel to unblock a bubble goroutine.
+	// Check both gp.bubble (normal) and gp.bubbleHome (during External — bubble
+	// is temporarily cleared but goroutine must return to bubble's P).
 	pp := mp.p.ptr()
-	if gp.bubble != nil && gp.bubble.pp != nil && gp.bubble.pp != pp {
-		pp = gp.bubble.pp
+	gpBubble := gp.bubble
+	if gpBubble == nil {
+		gpBubble = gp.bubbleHome
+	}
+	if gpBubble != nil && gpBubble.pp != nil && gpBubble.pp != pp {
+		pp = gpBubble.pp
 		// When waking root during rootInHook (orchestrator responded on channel),
 		// use runnext so findRunnable can pick it up immediately without scanning
 		// the circular buffer. For other bubble goroutines, don't displace runnext.
-		if gp == gp.bubble.root && gp.bubble.rootInHook {
+		if gp == gpBubble.root && gpBubble.rootInHook {
 			next = true
 		} else {
 			next = false // don't displace runnext on a different P
 		}
-	} else if gp.bubble == nil && pp.bubble != nil {
+	} else if gpBubble == nil && pp.bubble != nil {
 		// Non-bubble goroutine woken from bubble context (e.g., bubble root sends
 		// on channel to orchestrator). Don't strand it on the bubble's P — the
 		// rootInHook pause would prevent it from running. Use global runq instead.
@@ -3679,6 +3686,16 @@ top:
 		return gp, inheritTime, false
 	}
 
+	// Bubble: external goroutines pending — keep P, spin-wait.
+	// When external > 0, goroutines are blocked on external channels
+	// (e.g., redis call, orchestrator channel). Cross-P goready will
+	// deposit the woken goroutine on our runq. Spin with osyield until
+	// it arrives. goto top re-checks GC stop-the-world, timers, etc.
+	if b := pp.bubble; b != nil && b.external > 0 && runqempty(pp) {
+		osyield()
+		goto top
+	}
+
 	// global runq
 	// Skip for bubble Ps: bubble goroutines must stay local.
 	if pp.bubble == nil && !sched.runq.empty() {
@@ -3821,6 +3838,16 @@ top:
 		// See "Delicate dance" comment below.
 		mp.becomeSpinning()
 		unlock(&sched.lock)
+		goto top
+	}
+	// Bubble Ps must never be released to the idle pool. Goroutines can
+	// only reach a bubble P's runq via cross-P goready, and wakep() can't
+	// reliably re-acquire a specific P. If we release, the goroutine is
+	// orphaned — no M will process the bubble P's runq. Spin-wait instead;
+	// cross-P goready or maybeWakeLocked will deposit work shortly.
+	if pp.bubble != nil {
+		unlock(&sched.lock)
+		osyield()
 		goto top
 	}
 	if releasep() != pp {

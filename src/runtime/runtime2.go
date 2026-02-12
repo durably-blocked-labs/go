@@ -579,7 +579,8 @@ type g struct {
 	// bubbleSpawnPC is the PC of the "go" statement that created this goroutine.
 	bubbleGid     uint32
 	bubbleSpawnPC uintptr
-	bubbleGlobal  bool // true if marked as global (scheduling decisions forwarded to orchestrator)
+	bubbleGlobal  bool              // true if marked as global (scheduling decisions forwarded to orchestrator)
+	bubbleHome    *synctestBubble  // saved bubble during External (gp.bubble is nil while external)
 
 	// xRegs stores the extended register state if this G has been
 	// asynchronously preempted.

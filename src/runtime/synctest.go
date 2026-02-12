@@ -50,6 +50,7 @@ type bubbleState struct {
 	now          int64
 	timerCount   int32
 	nextTimer    int64
+	lastBgid     uint32
 }
 
 // Signal types for communication between findRunnable (g0) and root goroutine.
@@ -81,9 +82,10 @@ type synctestBubble struct {
 	// For example, park_m can choose to immediately unpark a goroutine after parking it.
 	// It increments the active count to keep the bubble active until it has determined
 	// that the park operation has completed.
-	total   int // total goroutines
-	running int // non-blocked goroutines
-	active  int // other sources of activity
+	total    int // total goroutines
+	running  int // non-blocked goroutines
+	active   int // other sources of activity
+	external int // goroutines currently inside CallExternal/External
 
 	// Deterministic goroutine IDs within this bubble.
 	// Assigned sequentially as goroutines are created.
@@ -122,6 +124,12 @@ type synctestBubble struct {
 	// When set, findRunnable must not try to wake root again (the hook may block,
 	// e.g., waiting for an orchestrator response on a channel).
 	rootInHook bool
+
+	// lastScheduledBgid is the bubble gid of the goroutine that was most recently
+	// scheduled on this bubble's P. When the hook fires, this tells the orchestrator
+	// which goroutine just yielded (since whoever ran last must have yielded to
+	// get back into findRunnable).
+	lastScheduledBgid uint32
 
 	// Orchestrator hooks, set before synctestRun by the orchestrator.
 	// Called by the root goroutine from the synctestRun control loop.
@@ -222,6 +230,13 @@ func (bubble *synctestBubble) decActive() {
 // maybeWakeLocked returns a g to wake if the bubble is durably blocked.
 func (bubble *synctestBubble) maybeWakeLocked() *g {
 	if bubble.running > 0 || bubble.active > 0 {
+		return nil
+	}
+	if bubble.external > 0 {
+		// Goroutines are blocked on external events (External/CallExternal).
+		// Don't wake root — it would just park again in synctestidle_c,
+		// creating a CPU-wasting bounce loop. The goroutine will eventually
+		// return from External/CallExternal and resume bubble activity.
 		return nil
 	}
 	// Increment the bubble active count, since we've determined to wake something.
@@ -341,6 +356,36 @@ func synctestRunImpl(f func(), prefix []bubbleDecision) []bubbleDecision {
 		bubble.pp = nil
 	}()
 
+	// Migrate any non-bubble goroutines from this P's local runq to the global
+	// runq. These goroutines were queued before the bubble was created and should
+	// not stay on the bubble P — they would be stranded by the rootInHook spin
+	// loop (which only picks root from runnext) or missed when synctestidle_c
+	// returns false (root spins via execute, bypassing findRunnable entirely).
+	systemstack(func() {
+		migrated := false
+		if next := pp.runnext; next != 0 {
+			if pp.runnext.cas(next, 0) {
+				lock(&sched.lock)
+				globrunqput(next.ptr())
+				unlock(&sched.lock)
+				migrated = true
+			}
+		}
+		for {
+			gp, _ := runqget(pp)
+			if gp == nil {
+				break
+			}
+			lock(&sched.lock)
+			globrunqput(gp)
+			unlock(&sched.lock)
+			migrated = true
+		}
+		if migrated {
+			wakep()
+		}
+	})
+
 	// This is newproc, but also records the new g in bubble.main.
 	pc := sys.GetCallerPC()
 	systemstack(func() {
@@ -377,6 +422,7 @@ func synctestRunImpl(f func(), prefix []bubbleDecision) []bubbleDecision {
 					blocked:   int32(bubble.total - bubble.running),
 					now:       bubble.now,
 					nextTimer: bubble.timers.wakeTime(),
+					lastBgid:  bubble.lastScheduledBgid,
 				}
 				for i := int32(0); i < bubble.pendingSize && i < bubbleMaxRunq; i++ {
 					state.runnableBgid[i] = bubble.pendingRunq[i]
@@ -398,6 +444,17 @@ func synctestRunImpl(f func(), prefix []bubbleDecision) []bubbleDecision {
 		}
 		next := bubble.timers.wakeTime()
 		if next == 0 {
+			if bubble.external > 0 {
+				// Goroutines are waiting on external events (External/CallExternal).
+				// Don't declare deadlock — go back to sleep.
+				continue
+			}
+			if bubble.running > 1 {
+				// Other goroutines besides root are still running (running includes
+				// root). This can happen when maybeWakeLocked fires from a goroutine
+				// parking while another is still active. Go back to sleep.
+				continue
+			}
 			break
 		}
 		if next < bubble.now {
@@ -457,8 +514,16 @@ func synctestidle_c(gp *g, _ unsafe.Pointer) bool {
 	lock(&gp.bubble.mu)
 	canIdle := true
 	if gp.bubble.running == 0 && gp.bubble.active == 1 {
-		// All goroutines in the bubble have blocked or exited.
-		canIdle = false
+		if gp.bubble.external > 0 {
+			// Goroutines are waiting on external events (CallExternal/External).
+			// Park the root. Cross-P goready will deposit goroutine on our runq;
+			// findRunnable's osyield loop will pick it up.
+			gp.bubble.active--
+			canIdle = true
+		} else {
+			// All goroutines in the bubble have blocked or exited.
+			canIdle = false
+		}
 	} else {
 		gp.bubble.active--
 	}
@@ -554,6 +619,84 @@ func synctestMarkGlobal() {
 		return
 	}
 	gp.bubbleGlobal = true
+}
+
+// synctestIncExternal increments the external counter for the current bubble.
+// Used by both External and CallExternal to signal that a goroutine is
+// performing an external operation. When external > 0, synctestidle_c parks
+// root and synctestRunImpl doesn't declare deadlock.
+//
+//go:linkname synctestIncExternal internal/synctest.incExternal
+func synctestIncExternal() {
+	gp := getg()
+	b := gp.bubble
+	if b == nil {
+		return
+	}
+	lock(&b.mu)
+	b.external++
+	unlock(&b.mu)
+}
+
+// synctestDecExternal decrements the external counter for the current bubble.
+//
+//go:linkname synctestDecExternal internal/synctest.decExternal
+func synctestDecExternal() {
+	gp := getg()
+	b := gp.bubble
+	if b == nil {
+		b = gp.bubbleHome // during External, gp.bubble is nil
+	}
+	if b == nil {
+		return
+	}
+	lock(&b.mu)
+	b.external--
+	wake := b.maybeWakeLocked()
+	unlock(&b.mu)
+	if wake != nil {
+		goready(wake, 0)
+	}
+}
+
+// synctestDetachBubble detaches the current goroutine from its bubble.
+// Used by External (NOT CallExternal) to make channel operations during fn()
+// invisible to the bubble's boundary checks. Channels created while detached
+// are untagged (c.bubble=nil), allowing external servers to send on them.
+//
+// Also decrements running so the bubble correctly tracks active goroutines.
+// The goroutine's state transitions (park/unpark) are invisible to the bubble
+// while detached, so running must be adjusted manually.
+//
+//go:linkname synctestDetachBubble internal/synctest.detachBubble
+func synctestDetachBubble() {
+	gp := getg()
+	b := gp.bubble
+	if b == nil {
+		return
+	}
+	lock(&b.mu)
+	b.running--
+	unlock(&b.mu)
+	gp.bubbleHome = b
+	gp.bubble = nil
+}
+
+// synctestReattachBubble re-attaches the current goroutine to its bubble
+// after External returns. Restores gp.bubble and increments running.
+//
+//go:linkname synctestReattachBubble internal/synctest.reattachBubble
+func synctestReattachBubble() {
+	gp := getg()
+	b := gp.bubbleHome
+	if b == nil {
+		return
+	}
+	gp.bubble = b
+	gp.bubbleHome = nil
+	lock(&b.mu)
+	b.running++
+	unlock(&b.mu)
 }
 
 // synctestGetDecisions returns a copy of the current bubble's decisions.

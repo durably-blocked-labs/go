@@ -357,9 +357,24 @@ func MarkGlobal() {
 	synctest.MarkGlobal()
 }
 
-// CallExternal marks the current goroutine as global and calls fn.
-// Use this to wrap RPC calls or other external operations so that
-// their scheduling decisions are forwarded to the orchestrator.
+// External wraps fn with the external counter so the bubble parks
+// properly when fn blocks on an external channel. Does NOT mark the
+// goroutine as global — the decision hook sees it as local (FIFO).
+//
+// Use this for external operations (e.g., redis calls) that need the
+// bubble to park but should not be forwarded to the orchestrator.
+//
+// External must be called from within a bubble.
+func External(fn func()) {
+	synctest.External(fn)
+}
+
+// CallExternal marks the current goroutine as global and wraps fn
+// with the external counter. Global goroutines are forwarded to the
+// orchestrator by the decision hook.
+//
+// Use this for RPC calls or other external operations whose scheduling
+// decisions should be controlled by the orchestrator.
 //
 // CallExternal must be called from within a bubble.
 func CallExternal(fn func()) {

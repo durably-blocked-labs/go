@@ -36,6 +36,7 @@ type BubbleState struct {
 	Now          int64
 	TimerCount   int32
 	NextTimer    int64
+	LastBgid     uint32
 }
 
 //go:linkname Run
@@ -65,11 +66,55 @@ func SetDecisionHook(fn func(BubbleState) int32)
 //go:linkname MarkGlobal
 func MarkGlobal()
 
-// CallExternal marks the current goroutine as global and calls fn.
-// This is a convenience wrapper for MarkGlobal + fn().
+// incExternal increments the external counter for the current bubble.
+//
+//go:linkname incExternal
+func incExternal()
+
+// decExternal decrements the external counter for the current bubble.
+//
+//go:linkname decExternal
+func decExternal()
+
+// detachBubble detaches the current goroutine from its bubble, saving it
+// in gp.bubbleHome. Channels created while detached are untagged.
+//
+//go:linkname detachBubble
+func detachBubble()
+
+// reattachBubble re-attaches the current goroutine to its bubble.
+//
+//go:linkname reattachBubble
+func reattachBubble()
+
+// External wraps fn with the external counter AND detaches the goroutine
+// from the bubble. This means:
+//   - Channels created inside fn are NOT tagged with the bubble.
+//   - External servers can freely send/receive on those channels.
+//   - The decision hook does not see this goroutine (gp.bubble is nil).
+//
+// Use External for operations like Redis GET/SET where the bubble
+// needs to park but the orchestrator doesn't need to intercept.
+func External(fn func()) {
+	incExternal()
+	detachBubble()
+	fn()
+	reattachBubble()
+	decExternal()
+}
+
+// CallExternal marks the current goroutine as global and wraps fn
+// with the external counter. Unlike External, the goroutine stays
+// attached to the bubble — Gosched inside fn triggers decision hooks,
+// and the orchestrator sees the goroutine as global.
+//
+// Use CallExternal for operations the orchestrator should intercept
+// (e.g., RPC send/receive, inbox listen).
 func CallExternal(fn func()) {
 	MarkGlobal()
+	incExternal()
 	fn()
+	decExternal()
 }
 
 // IsInBubble reports whether the current goroutine is in a bubble.
