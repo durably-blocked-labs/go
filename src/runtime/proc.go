@@ -3786,6 +3786,14 @@ top:
 		goto top
 	}
 
+	// Bubble Ps must never go idle — goroutines can arrive via cross-P
+	// goready at any time (e.g., orchestrator unblocking a channel send).
+	// Yield briefly and re-check instead of falling through to pidleput.
+	if pp.bubble != nil {
+		osyield()
+		goto top
+	}
+
 	// Before we drop our P, make a snapshot of the allp slice,
 	// which can change underfoot once we no longer block
 	// safe-points. We don't need to snapshot the contents because
