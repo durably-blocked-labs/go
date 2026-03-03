@@ -37,6 +37,8 @@ type BubbleState struct {
 	TimerCount   int32
 	NextTimer    int64
 	LastBgid     uint32
+	External     int32
+	ExternalWait int32
 }
 
 //go:linkname Run
@@ -87,6 +89,22 @@ func detachBubble()
 //go:linkname reattachBubble
 func reattachBubble()
 
+// incExternalWait increments the externalWait counter for the current bubble.
+//
+//go:linkname incExternalWait
+func incExternalWait()
+
+// decExternalWait decrements the externalWait counter for the current bubble.
+//
+//go:linkname decExternalWait
+func decExternalWait()
+
+// SetTime sets the bubble's fake clock to t (nanoseconds since epoch).
+// If t is before the current time, the call is a no-op.
+//
+//go:linkname SetTime
+func SetTime(t int64)
+
 // External wraps fn with the external counter AND detaches the goroutine
 // from the bubble. This means:
 //   - Channels created inside fn are NOT tagged with the bubble.
@@ -115,6 +133,26 @@ func CallExternal(fn func()) {
 	incExternal()
 	fn()
 	decExternal()
+}
+
+// ExternalWait wraps fn with the externalWait counter AND detaches the
+// goroutine from the bubble. Like External, channels created inside fn
+// are NOT tagged with the bubble.
+//
+// Unlike External (which tracks generic external IO), ExternalWait
+// increments the externalWait counter. When all goroutines are blocked
+// with externalWait > 0, the bubble's decision hook fires with
+// Idle: true, allowing the orchestrator to deliver a message or
+// advance time.
+//
+// Use ExternalWait for operations on orchestrator-controlled channels
+// (e.g., sending/receiving RPC messages via a mock transport).
+func ExternalWait(fn func()) {
+	incExternalWait()
+	detachBubble()
+	fn()
+	reattachBubble()
+	decExternalWait()
 }
 
 // IsInBubble reports whether the current goroutine is in a bubble.

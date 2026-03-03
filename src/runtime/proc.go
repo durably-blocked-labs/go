@@ -3687,11 +3687,11 @@ top:
 	}
 
 	// Bubble: external goroutines pending — keep P, spin-wait.
-	// When external > 0, goroutines are blocked on external channels
-	// (e.g., redis call, orchestrator channel). Cross-P goready will
-	// deposit the woken goroutine on our runq. Spin with osyield until
-	// it arrives. goto top re-checks GC stop-the-world, timers, etc.
-	if b := pp.bubble; b != nil && b.external > 0 && runqempty(pp) {
+	// When external > 0 or externalWait > 0, goroutines are blocked on
+	// external channels (e.g., redis call, orchestrator channel). Cross-P
+	// goready will deposit the woken goroutine on our runq. Spin with
+	// osyield until it arrives. goto top re-checks GC stop-the-world, timers, etc.
+	if b := pp.bubble; b != nil && (b.external > 0 || b.externalWait > 0) && runqempty(pp) {
 		osyield()
 		goto top
 	}

@@ -51,6 +51,8 @@ type bubbleState struct {
 	timerCount   int32
 	nextTimer    int64
 	lastBgid     uint32
+	external     int32
+	externalWait int32
 }
 
 // Signal types for communication between findRunnable (g0) and root goroutine.
@@ -85,7 +87,8 @@ type synctestBubble struct {
 	total    int // total goroutines
 	running  int // non-blocked goroutines
 	active   int // other sources of activity
-	external int // goroutines currently inside CallExternal/External
+	external     int // goroutines currently inside CallExternal/External
+	externalWait int // goroutines currently inside ExternalWait (orchestrator-controlled)
 
 	// Deterministic goroutine IDs within this bubble.
 	// Assigned sequentially as goroutines are created.
@@ -237,6 +240,23 @@ func (bubble *synctestBubble) maybeWakeLocked() *g {
 		// Don't wake root — it would just park again in synctestidle_c,
 		// creating a CPU-wasting bounce loop. The goroutine will eventually
 		// return from External/CallExternal and resume bubble activity.
+		return nil
+	}
+	if bubble.externalWait > 0 {
+		if bubble.onDecision != nil {
+			// Goroutines waiting on orchestrator-controlled channels
+			// (ExternalWait). Wake root so it can call the idle hook,
+			// which will block until the orchestrator delivers a message
+			// or advances time.
+			//
+			// This does NOT create a bounce loop: when root blocks on
+			// the orchestrator's non-bubble channel inside the hook,
+			// the waitReason is not in isIdleInSynctest, so running is
+			// NOT decremented. The bubble sees root as "running."
+			bubble.active++
+			return bubble.root
+		}
+		// No hook set — just wait silently, like external.
 		return nil
 	}
 	// Increment the bubble active count, since we've determined to wake something.
@@ -417,12 +437,14 @@ func synctestRunImpl(f func(), prefix []bubbleDecision) []bubbleDecision {
 			idx := int32(0) // default FIFO
 			if bubble.onDecision != nil {
 				state := bubbleState{
-					step:      bubble.decisionLen,
-					runnableN: bubble.pendingSize,
-					blocked:   int32(bubble.total - bubble.running),
-					now:       bubble.now,
-					nextTimer: bubble.timers.wakeTime(),
-					lastBgid:  bubble.lastScheduledBgid,
+					step:         bubble.decisionLen,
+					runnableN:    bubble.pendingSize,
+					blocked:      int32(bubble.total - bubble.running),
+					now:          bubble.now,
+					nextTimer:    bubble.timers.wakeTime(),
+					lastBgid:     bubble.lastScheduledBgid,
+					external:     int32(bubble.external),
+					externalWait: int32(bubble.externalWait),
 				}
 				for i := int32(0); i < bubble.pendingSize && i < bubbleMaxRunq; i++ {
 					state.runnableBgid[i] = bubble.pendingRunq[i]
@@ -442,11 +464,46 @@ func synctestRunImpl(f func(), prefix []bubbleDecision) []bubbleDecision {
 		if bubble.active < 0 {
 			throw("active < 0")
 		}
+
+		// ── Idle hook (orchestrator-controlled bubbles) ──────────────
+		// When externalWait > 0, a hook is set, and no goroutines are
+		// pending on the runq, fire the idle hook. The orchestrator
+		// will deliver a message or advance time.
+		//
+		// The runqempty check prevents stranding: after a previous
+		// idle hook delivery, the bridge goroutine may be on the runq
+		// but not yet scheduled. Let findRunnable + the scheduling
+		// decision hook handle it first.
+		if bubble.externalWait > 0 && bubble.onDecision != nil && runqempty(bubble.pp) {
+			state := bubbleState{
+				step:         bubble.decisionLen,
+				blocked:      int32(bubble.total - bubble.running),
+				idle:         true,
+				now:          bubble.now,
+				nextTimer:    bubble.timers.wakeTime(),
+				lastBgid:     bubble.lastScheduledBgid,
+				external:     int32(bubble.external),
+				externalWait: int32(bubble.externalWait),
+			}
+			unlock(&bubble.mu)
+			bubble.rootInHook = true
+			_ = bubble.onDecision(state) // blocks — orchestrator decides
+			bubble.rootInHook = false
+			lock(&bubble.mu)
+			continue
+		}
+
+		// ── Existing logic (unchanged for externalWait == 0) ─────────
 		next := bubble.timers.wakeTime()
 		if next == 0 {
 			if bubble.external > 0 {
 				// Goroutines are waiting on external events (External/CallExternal).
 				// Don't declare deadlock — go back to sleep.
+				continue
+			}
+			if bubble.externalWait > 0 {
+				// Goroutines waiting on orchestrator (no hook set, or
+				// runq not empty). Don't declare deadlock.
 				continue
 			}
 			if bubble.running > 1 {
@@ -463,6 +520,11 @@ func synctestRunImpl(f func(), prefix []bubbleDecision) []bubbleDecision {
 		if bubble.done {
 			// Time stops once the bubble's main goroutine has exited.
 			break
+		}
+		// Only auto-advance time when orchestrator is NOT in control.
+		// When externalWait > 0, the orchestrator owns time via SetTime.
+		if bubble.externalWait > 0 {
+			continue
 		}
 		bubble.now = next
 	}
@@ -514,8 +576,9 @@ func synctestidle_c(gp *g, _ unsafe.Pointer) bool {
 	lock(&gp.bubble.mu)
 	canIdle := true
 	if gp.bubble.running == 0 && gp.bubble.active == 1 {
-		if gp.bubble.external > 0 {
-			// Goroutines are waiting on external events (CallExternal/External).
+		if gp.bubble.external > 0 || gp.bubble.externalWait > 0 {
+			// Goroutines are waiting on external events (External/CallExternal)
+			// or orchestrator-controlled channels (ExternalWait).
 			// Park the root. Cross-P goready will deposit goroutine on our runq;
 			// findRunnable's osyield loop will pick it up.
 			gp.bubble.active--
@@ -657,6 +720,65 @@ func synctestDecExternal() {
 	if wake != nil {
 		goready(wake, 0)
 	}
+}
+
+// synctestIncExternalWait increments the externalWait counter for the current bubble.
+// Used by ExternalWait to signal that a goroutine is waiting on an
+// orchestrator-controlled channel. When externalWait > 0, the idle hook
+// fires instead of declaring deadlock or auto-advancing time.
+//
+//go:linkname synctestIncExternalWait internal/synctest.incExternalWait
+func synctestIncExternalWait() {
+	gp := getg()
+	b := gp.bubble
+	if b == nil {
+		return
+	}
+	lock(&b.mu)
+	b.externalWait++
+	unlock(&b.mu)
+}
+
+// synctestDecExternalWait decrements the externalWait counter for the current bubble.
+//
+//go:linkname synctestDecExternalWait internal/synctest.decExternalWait
+func synctestDecExternalWait() {
+	gp := getg()
+	b := gp.bubble
+	if b == nil {
+		b = gp.bubbleHome // during ExternalWait, gp.bubble is nil
+	}
+	if b == nil {
+		return
+	}
+	lock(&b.mu)
+	b.externalWait--
+	if b.externalWait < 0 {
+		throw("externalWait < 0")
+	}
+	wake := b.maybeWakeLocked()
+	unlock(&b.mu)
+	if wake != nil {
+		goready(wake, 0)
+	}
+}
+
+// synctestSetTime sets the bubble's fake clock to t (nanoseconds since epoch).
+// If t is before the current time, the call is a no-op.
+// Intended to be called from inside the decision hook by the orchestrator.
+//
+//go:linkname synctestSetTime internal/synctest.SetTime
+func synctestSetTime(t int64) {
+	gp := getg()
+	b := gp.bubble
+	if b == nil {
+		return
+	}
+	lock(&b.mu)
+	if t > b.now {
+		b.now = t
+	}
+	unlock(&b.mu)
 }
 
 // synctestDetachBubble detaches the current goroutine from its bubble.

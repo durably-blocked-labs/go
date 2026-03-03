@@ -381,6 +381,40 @@ func CallExternal(fn func()) {
 	synctest.CallExternal(fn)
 }
 
+// ExternalWait wraps fn so the bubble correctly tracks goroutines
+// waiting on orchestrator-controlled channels. The goroutine is
+// detached from the bubble during fn (channels created inside fn
+// are untagged).
+//
+// Unlike External (which tracks generic external IO), ExternalWait
+// tells the bubble that the orchestrator CAN unblock this goroutine.
+// When all goroutines are blocked with externalWait > 0, the decision
+// hook fires with Idle: true, allowing the orchestrator to deliver a
+// message or advance time.
+//
+// ExternalWait must be called from within a bubble.
+func ExternalWait(fn func()) {
+	synctest.ExternalWait(fn)
+}
+
+// SetTime sets the bubble's fake clock to t (nanoseconds since epoch).
+// If t is before the current time, the call is a no-op.
+//
+// When the event loop next iterates, any timers with deadlines <= t
+// fire automatically.
+//
+// SetTime is intended to be called from inside the decision hook
+// (on the root goroutine) by the orchestrator, to synchronize time
+// across multiple bubbles.
+//
+// When externalWait > 0 and a hook is set, timer auto-advancement is
+// disabled — the orchestrator owns time via SetTime.
+//
+// SetTime must be called from within a bubble.
+func SetTime(t int64) {
+	synctest.SetTime(t)
+}
+
 // Wait blocks until every goroutine within the current bubble,
 // other than the current goroutine, is durably blocked.
 //
