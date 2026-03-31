@@ -799,9 +799,13 @@ func synctestDetachBubble() {
 	}
 	lock(&b.mu)
 	b.running--
+	wake := b.maybeWakeLocked()
 	unlock(&b.mu)
 	gp.bubbleHome = b
 	gp.bubble = nil
+	if wake != nil {
+		goready(wake, 0)
+	}
 }
 
 // synctestReattachBubble re-attaches the current goroutine to its bubble
