@@ -796,6 +796,28 @@ func bubbleFinishRecord(b *synctestBubble, gp *g, idx int32) {
 	b.decisionLen = n + 1
 }
 
+func bubbleReplayDiverged(b *synctestBubble, idx int32, reason uint8) (*g, bool, bool) {
+	runqSize := int32(0)
+	if b != nil && b.decisions != nil && b.decisionLen < bubbleMaxDecisions {
+		runqSize = b.decisions[b.decisionLen].runqSize
+	}
+	b.replayReason = reason
+	b.replayStep = b.decisionLen
+	b.replayIndex = idx
+	b.replayRunqSize = runqSize
+	b.signal = bubbleSignalReplayDiverged
+
+	lock(&b.mu)
+	b.active++
+	unlock(&b.mu)
+
+	if readgstatus(b.root)&^_Gscan != _Gwaiting {
+		throw("synctest replay divergence while root not waiting")
+	}
+	casgstatus(b.root, _Gwaiting, _Grunnable)
+	return b.root, false, false
+}
+
 // runqpick removes the n-th goroutine from pp's local run queue.
 // Position 0 is runnext (if populated), then circular buffer entries from head.
 // Returns nil if the position is out of range.
@@ -1230,6 +1252,12 @@ func ready(gp *g, traceskip int, next bool) {
 	gpBubble := gp.bubble
 	if gpBubble == nil {
 		gpBubble = gp.bubbleHome
+	}
+	if gpBubble != nil && gp == gpBubble.root && gpBubble.rootInHook {
+		// A resumed bubble root must land in runnext while the scheduler is
+		// paused in the rootInHook loop below. That loop only checks runnext,
+		// so same-P wakeups need the same treatment as cross-P wakeups.
+		next = true
 	}
 	if gpBubble != nil && gpBubble.pp != nil && gpBubble.pp != pp {
 		pp = gpBubble.pp
@@ -3597,7 +3625,7 @@ top:
 			bubbleFinishRecord(b, gp, b.decidedIndex)
 			return gp, inheritTime, false
 		}
-		// runqpick failed — fall through to normal path.
+		return bubbleReplayDiverged(b, b.decidedIndex, 1)
 	}
 
 	// Bubble: follow pre-loaded decisions before default runqget.
@@ -3609,9 +3637,7 @@ top:
 			bubbleFinishRecord(b, gp, d.index)
 			return gp, inheritTime, false
 		}
-		// runqpick failed (runq empty — expected goroutine not yet runnable).
-		// Fall through to normal path without recording anything.
-		// The normal path's bubblePreSnapshot will overwrite the partial snapshot.
+		return bubbleReplayDiverged(b, d.index, 2)
 	}
 
 	// Bubble: frontier — past pre-loaded decisions, hook wants to decide.
@@ -3686,17 +3712,19 @@ top:
 		return gp, inheritTime, false
 	}
 
-	// Bubble: external goroutines pending — keep P, spin-wait.
-	// When external > 0 or externalWait > 0, goroutines are blocked on
-	// external channels (e.g., redis call, orchestrator channel). Cross-P
-	// goready will deposit the woken goroutine on our runq. Spin with
-	// osyield until it arrives. goto top re-checks GC stop-the-world, timers, etc.
-	if b := pp.bubble; b != nil && (b.external > 0 || b.externalWait > 0) && runqempty(pp) {
-		osyield()
-		goto top
-	}
+		// Bubble: external goroutines pending — keep P, but back off while waiting.
+		// When external > 0 or externalWait > 0, goroutines are blocked on
+		// external channels (e.g., redis call, orchestrator channel). Cross-P
+		// goready will deposit the woken goroutine on our runq. Avoid a pure
+		// osyield spin here: distributed exploration can sit in this state for
+		// thousands of short waits, which otherwise burns CPU without helping the
+		// wakeup arrive any sooner.
+		if b := pp.bubble; b != nil && (b.external > 0 || b.externalWait > 0) && runqempty(pp) {
+			osyield()
+			goto top
+		}
 
-	// global runq
+		// global runq
 	// Skip for bubble Ps: bubble goroutines must stay local.
 	if pp.bubble == nil && !sched.runq.empty() {
 		lock(&sched.lock)
@@ -3853,12 +3881,12 @@ top:
 	// reliably re-acquire a specific P. If we release, the goroutine is
 	// orphaned — no M will process the bubble P's runq. Spin-wait instead;
 	// cross-P goready or maybeWakeLocked will deposit work shortly.
-	if pp.bubble != nil {
-		unlock(&sched.lock)
-		osyield()
-		goto top
-	}
-	if releasep() != pp {
+		if pp.bubble != nil {
+			unlock(&sched.lock)
+			osyield()
+			goto top
+		}
+		if releasep() != pp {
 		throw("findRunnable: wrong p")
 	}
 	now = pidleput(pp, now)

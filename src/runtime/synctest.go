@@ -30,7 +30,7 @@ type bubbleDecision struct {
 	chosenSpawnPC uintptr // PC of the "go" statement that created it
 
 	// Observability: state of the runnable set at this decision point.
-	runqSize  int32              // total runnable goroutines (including chosen)
+	runqSize  int32                 // total runnable goroutines (including chosen)
 	runqBgids [bubbleMaxRunq]uint32 // bubble gids of all runnable goroutines
 
 	// Context.
@@ -57,8 +57,9 @@ type bubbleState struct {
 
 // Signal types for communication between findRunnable (g0) and root goroutine.
 const (
-	bubbleSignalNone         = 0
-	bubbleSignalNeedDecision = 1
+	bubbleSignalNone           = 0
+	bubbleSignalNeedDecision   = 1
+	bubbleSignalReplayDiverged = 2
 )
 
 // A synctestBubble is a set of goroutines started by synctest.Run.
@@ -84,9 +85,9 @@ type synctestBubble struct {
 	// For example, park_m can choose to immediately unpark a goroutine after parking it.
 	// It increments the active count to keep the bubble active until it has determined
 	// that the park operation has completed.
-	total    int // total goroutines
-	running  int // non-blocked goroutines
-	active   int // other sources of activity
+	total        int // total goroutines
+	running      int // non-blocked goroutines
+	active       int // other sources of activity
 	external     int // goroutines currently inside CallExternal/External
 	externalWait int // goroutines currently inside ExternalWait (orchestrator-controlled)
 
@@ -127,6 +128,17 @@ type synctestBubble struct {
 	// When set, findRunnable must not try to wake root again (the hook may block,
 	// e.g., waiting for an orchestrator response on a channel).
 	rootInHook bool
+
+	// delegateIdle suppresses hook-owned idle handling after the hook returns a
+	// negative value. It is cleared the next time a real frontier decision is
+	// needed, at which point the hook regains control.
+	delegateIdle bool
+
+	// Replay divergence captured by g0 and surfaced by root.
+	replayReason   uint8
+	replayStep     int32
+	replayIndex    int32
+	replayRunqSize int32
 
 	// lastScheduledBgid is the bubble gid of the goroutine that was most recently
 	// scheduled on this bubble's P. When the hook fires, this tells the orchestrator
@@ -242,20 +254,12 @@ func (bubble *synctestBubble) maybeWakeLocked() *g {
 		// return from External/CallExternal and resume bubble activity.
 		return nil
 	}
+	if bubble.onDecision != nil && !bubble.delegateIdle {
+		// Once a decision hook is installed, it owns idle/time handling.
+		bubble.active++
+		return bubble.root
+	}
 	if bubble.externalWait > 0 {
-		if bubble.onDecision != nil {
-			// Goroutines waiting on orchestrator-controlled channels
-			// (ExternalWait). Wake root so it can call the idle hook,
-			// which will block until the orchestrator delivers a message
-			// or advances time.
-			//
-			// This does NOT create a bounce loop: when root blocks on
-			// the orchestrator's non-bubble channel inside the hook,
-			// the waitReason is not in isIdleInSynctest, so running is
-			// NOT decremented. The bubble sees root as "running."
-			bubble.active++
-			return bubble.root
-		}
 		// No hook set — just wait silently, like external.
 		return nil
 	}
@@ -430,12 +434,23 @@ func synctestRunImpl(f func(), prefix []bubbleDecision) []bubbleDecision {
 		})
 		gopark(synctestidle_c, nil, waitReasonSynctestRun, traceBlockSynctest, 0)
 
+		if bubble.signal == bubbleSignalReplayDiverged {
+			bubble.signal = bubbleSignalNone
+			panic(synctestReplayDivergenceError{
+				reason:   bubble.replayReason,
+				step:     bubble.replayStep,
+				index:    bubble.replayIndex,
+				runqSize: bubble.replayRunqSize,
+			})
+		}
+
 		// Handle frontier decision signal before locking.
 		// findRunnable woke us because it needs a scheduling decision.
 		if bubble.signal == bubbleSignalNeedDecision {
 			bubble.signal = bubbleSignalNone
 			idx := int32(0) // default FIFO
 			if bubble.onDecision != nil {
+				bubble.delegateIdle = false
 				state := bubbleState{
 					step:         bubble.decisionLen,
 					runnableN:    bubble.pendingSize,
@@ -461,20 +476,29 @@ func synctestRunImpl(f func(), prefix []bubbleDecision) []bubbleDecision {
 		}
 
 		lock(&bubble.mu)
+		// DelegateIdle is a one-shot handoff: it lets the just-resumed bubble
+		// pass through the default idle/time logic for the immediately following
+		// park/wake cycle. Once root wakes again, restore normal hook ownership
+		// so the next genuine idle point is reported back to the orchestrator.
+		if bubble.delegateIdle {
+			bubble.delegateIdle = false
+		}
 		if bubble.active < 0 {
 			throw("active < 0")
 		}
+		delegateIdle := false
 
 		// ── Idle hook (orchestrator-controlled bubbles) ──────────────
-		// When externalWait > 0, a hook is set, and no goroutines are
-		// pending on the runq, fire the idle hook. The orchestrator
-		// will deliver a message or advance time.
+		// When a hook is set and no goroutines are pending on the runq, fire
+		// the idle hook. Hook users may either fully own idle/time behavior or
+		// return a negative value to delegate back to the default synctest
+		// idle/time logic for this iteration.
 		//
 		// The runqempty check prevents stranding: after a previous
 		// idle hook delivery, the bridge goroutine may be on the runq
 		// but not yet scheduled. Let findRunnable + the scheduling
 		// decision hook handle it first.
-		if bubble.externalWait > 0 && bubble.onDecision != nil && runqempty(bubble.pp) {
+		if bubble.onDecision != nil && !bubble.delegateIdle && runqempty(bubble.pp) {
 			state := bubbleState{
 				step:         bubble.decisionLen,
 				blocked:      int32(bubble.total - bubble.running),
@@ -487,10 +511,15 @@ func synctestRunImpl(f func(), prefix []bubbleDecision) []bubbleDecision {
 			}
 			unlock(&bubble.mu)
 			bubble.rootInHook = true
-			_ = bubble.onDecision(state) // blocks — orchestrator decides
+			idx := bubble.onDecision(state)
 			bubble.rootInHook = false
 			lock(&bubble.mu)
-			continue
+			if idx >= 0 {
+				bubble.delegateIdle = false
+				continue
+			}
+			bubble.delegateIdle = true
+			delegateIdle = true
 		}
 
 		// ── Existing logic (unchanged for externalWait == 0) ─────────
@@ -521,9 +550,9 @@ func synctestRunImpl(f func(), prefix []bubbleDecision) []bubbleDecision {
 			// Time stops once the bubble's main goroutine has exited.
 			break
 		}
-		// Only auto-advance time when orchestrator is NOT in control.
-		// When externalWait > 0, the orchestrator owns time via SetTime.
-		if bubble.externalWait > 0 {
+		// Only auto-advance time when the idle hook did not claim ownership
+		// for this iteration.
+		if bubble.onDecision != nil && !delegateIdle {
 			continue
 		}
 		bubble.now = next
@@ -572,13 +601,32 @@ func (e synctestDeadlockError) Error() string {
 	return e.reason
 }
 
+type synctestReplayDivergenceError struct {
+	reason   uint8
+	step     int32
+	index    int32
+	runqSize int32
+}
+
+func (e synctestReplayDivergenceError) Error() string {
+	switch e.reason {
+	case 1:
+		return "synctest replay divergence: hook-selected goroutine not runnable"
+	case 2:
+		return "synctest replay divergence: prefixed goroutine not runnable"
+	default:
+		return "synctest replay divergence"
+	}
+}
+
 func synctestidle_c(gp *g, _ unsafe.Pointer) bool {
 	lock(&gp.bubble.mu)
 	canIdle := true
 	if gp.bubble.running == 0 && gp.bubble.active == 1 {
-		if gp.bubble.external > 0 || gp.bubble.externalWait > 0 {
+		if gp.bubble.external > 0 || gp.bubble.externalWait > 0 || (gp.bubble.onDecision != nil && !gp.bubble.delegateIdle) {
 			// Goroutines are waiting on external events (External/CallExternal)
-			// or orchestrator-controlled channels (ExternalWait).
+			// or orchestrator-controlled channels (ExternalWait), or a
+			// decision hook owns the next idle/time step.
 			// Park the root. Cross-P goready will deposit goroutine on our runq;
 			// findRunnable's osyield loop will pick it up.
 			gp.bubble.active--

@@ -339,6 +339,8 @@ func Explore(t *testing.T, f func(*testing.T), prefix []Decision) (trace []Decis
 // scheduling decision point within the current bubble. The hook receives
 // the bubble state (runnable goroutines, blocked count, fake time, etc.)
 // and returns the index of the goroutine to schedule next (0 = FIFO default).
+// When state.Idle is true, returning a negative value delegates back to the
+// default synctest idle/time handling for that iteration.
 //
 // SetDecisionHook must be called from within a bubble.
 // Passing nil restores the default FIFO scheduling.
