@@ -509,13 +509,13 @@ func synctestRunImpl(f func(), prefix []bubbleDecision) []bubbleDecision {
 		}
 
 		lock(&bubble.mu)
-		// DelegateIdle is a one-shot handoff: it lets the just-resumed bubble
-		// pass through the default idle/time logic for the immediately following
-		// park/wake cycle. Once root wakes again, restore normal hook ownership
-		// so the next genuine idle point is reported back to the orchestrator.
-		if bubble.delegateIdle {
-			bubble.delegateIdle = false
-		}
+		// delegateIdle persists until a real event requires the hook:
+		//   - bubbleSignalNeedDecision (line 458): goroutines are runnable
+		//   - bubbleSignalIdleHook (line 489): idle with externalWait > 0
+		// Both of those paths clear delegateIdle before calling the hook.
+		// We do NOT clear it here on a generic wake — doing so would cause
+		// the hook to re-fire after transient activity (e.g. bridge goroutine
+		// cleanup during Shutdown), blocking on a channel nobody reads.
 		if bubble.active < 0 {
 			throw("active < 0")
 		}
