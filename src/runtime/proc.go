@@ -3681,6 +3681,24 @@ top:
 		// Root already awake — fall through to normal path.
 	}
 
+	// Bubble: ExternalWait idle — wake root for idle hook via signal.
+	// When all bubble goroutines are durably blocked (runq empty, running=0)
+	// and bridges are in ExternalWait, the orchestrator needs to be notified
+	// via the idle hook. Wake root using the same signal+casgstatus mechanism
+	// as the frontier path (not goready), so root never lands in runnext and
+	// no scheduling decision is recorded.
+	if b := pp.bubble; b != nil && b.externalWait > 0 && b.onDecision != nil &&
+		!b.delegateIdle && runqempty(pp) && !b.rootInHook {
+		if readgstatus(b.root)&^_Gscan == _Gwaiting {
+			b.signal = bubbleSignalIdleHook
+			lock(&b.mu)
+			b.active++
+			unlock(&b.mu)
+			casgstatus(b.root, _Gwaiting, _Grunnable)
+			return b.root, false, false
+		}
+	}
+
 	// Bubble: hook is blocking on external I/O — pause the bubble.
 	// When rootInHook is true, the root goroutine is executing the onDecision
 	// hook, which is blocking (e.g., waiting for orchestrator response on a

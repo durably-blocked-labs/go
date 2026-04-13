@@ -60,6 +60,7 @@ const (
 	bubbleSignalNone           = 0
 	bubbleSignalNeedDecision   = 1
 	bubbleSignalReplayDiverged = 2
+	bubbleSignalIdleHook       = 3
 )
 
 // A synctestBubble is a set of goroutines started by synctest.Run.
@@ -254,14 +255,18 @@ func (bubble *synctestBubble) maybeWakeLocked() *g {
 		// return from External/CallExternal and resume bubble activity.
 		return nil
 	}
+	if bubble.externalWait > 0 {
+		// Goroutines are waiting on orchestrator-controlled channels
+		// (ExternalWait). Don't wake root from here — it would bounce
+		// (park/wake loop) because there's nothing to do until the
+		// orchestrator delivers a message. findRunnable handles idle
+		// hook notification via bubbleSignalIdleHook instead.
+		return nil
+	}
 	if bubble.onDecision != nil && !bubble.delegateIdle {
 		// Once a decision hook is installed, it owns idle/time handling.
 		bubble.active++
 		return bubble.root
-	}
-	if bubble.externalWait > 0 {
-		// No hook set — just wait silently, like external.
-		return nil
 	}
 	// Increment the bubble active count, since we've determined to wake something.
 	// The woken goroutine will decrement the count.
@@ -473,6 +478,34 @@ func synctestRunImpl(f func(), prefix []bubbleDecision) []bubbleDecision {
 			bubble.decisionReady = true
 			lock(&bubble.mu)
 			continue // back to top → unlock → timer check → gopark → findRunnable sees decisionReady
+		}
+
+		// Handle ExternalWait idle hook signal before locking.
+		// findRunnable woke us because the bubble is idle with externalWait > 0.
+		// Fire the idle hook so the orchestrator knows to deliver a message.
+		if bubble.signal == bubbleSignalIdleHook {
+			bubble.signal = bubbleSignalNone
+			if bubble.onDecision != nil {
+				bubble.delegateIdle = false
+				state := bubbleState{
+					step:         bubble.decisionLen,
+					blocked:      int32(bubble.total - bubble.running),
+					idle:         true,
+					now:          bubble.now,
+					nextTimer:    bubble.timers.wakeTime(),
+					lastBgid:     bubble.lastScheduledBgid,
+					external:     int32(bubble.external),
+					externalWait: int32(bubble.externalWait),
+				}
+				bubble.rootInHook = true
+				idx := bubble.onDecision(state)
+				bubble.rootInHook = false
+				if idx < 0 {
+					bubble.delegateIdle = true
+				}
+			}
+			lock(&bubble.mu)
+			continue
 		}
 
 		lock(&bubble.mu)
