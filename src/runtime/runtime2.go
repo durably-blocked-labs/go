@@ -1409,6 +1409,9 @@ var isIdleInSynctest = [len(waitReasonStrings)]bool{
 	waitReasonSynctestChanReceive:   true,
 	waitReasonSynctestChanSend:      true,
 	waitReasonSynctestSelect:        true,
+	waitReasonSyncMutexLock:         true,
+	waitReasonSyncRWMutexRLock:      true,
+	waitReasonSyncRWMutexLock:       true,
 }
 
 var (
