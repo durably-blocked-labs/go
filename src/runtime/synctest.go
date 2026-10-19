@@ -11,7 +11,7 @@ import (
 )
 
 // bubbleMaxDecisions is the maximum number of scheduling decisions
-// that can be recorded per bubble. Allocated via persistentalloc.
+// that can be recorded per bubble. Exceeding it fails closed.
 const bubbleMaxDecisions = 512
 
 // bubbleMaxRunq is the maximum number of runnable goroutines tracked
@@ -34,8 +34,10 @@ type bubbleDecision struct {
 	runqBgids [bubbleMaxRunq]uint32 // bubble gids of all runnable goroutines
 
 	// Context.
-	step       int32 // sequence number within this bubble
-	waitReason uint8 // why the previous goroutine yielded (waitReason enum)
+	step       int32   // sequence number within this bubble
+	waitReason uint8   // 255 = explicit Yield; otherwise reserved zero
+	kind       uint8   // 0 = Schedule, 1 = SelectReady
+	site       uintptr // main-module-relative select caller PC; zero for Schedule
 }
 
 // bubbleState is the state passed to the onDecision hook at frontier decision points.
@@ -104,10 +106,14 @@ type synctestBubble struct {
 	// (using its index field) instead of default FIFO. At the frontier
 	// (decisionLen >= decisionFence), the root goroutine is woken to decide.
 	// Either way, the actual decision is always recorded at decisions[decisionLen].
-	// Allocated via persistentalloc (not GC-managed, contains no pointers).
+	// GC-managed, allocated before scheduler use; the bubble retains the array.
 	decisions     *[bubbleMaxDecisions]bubbleDecision
 	decisionLen   int32 // decisions recorded so far (= step counter)
 	decisionFence int32 // pre-loaded decisions boundary (0 = no pre-load)
+	strictReplay  bool
+
+	// Foreign producers enqueue under mu; only the owner P drains into runq.
+	inbound gQueue
 
 	// Signaling between findRunnable (g0) and root goroutine.
 	// When findRunnable reaches the frontier and the runq is non-empty,
@@ -128,7 +134,11 @@ type synctestBubble struct {
 	// rootInHook is true while the root goroutine is executing the onDecision hook.
 	// When set, findRunnable must not try to wake root again (the hook may block,
 	// e.g., waiting for an orchestrator response on a channel).
-	rootInHook bool
+	rootInHook     bool
+	hookG          *g // hook executor (root for schedule, selecting goroutine for select)
+	onSelect       func(bubbleSelectState) int32
+	yieldReason    uint8
+	controlFailure any
 
 	// delegateIdle suppresses hook-owned idle handling after the hook returns a
 	// negative value. It is cleared the next time a real frontier decision is
@@ -304,15 +314,23 @@ var bubbleGen atomic.Uint64 // bubble ID counter
 
 //go:linkname synctestRun internal/synctest.Run
 func synctestRun(f func()) {
-	synctestRunImpl(f, nil)
+	synctestRunImpl(f, nil, false)
 }
 
 //go:linkname synctestRunExplore internal/synctest.RunExplore
 func synctestRunExplore(f func(), prefix []bubbleDecision) []bubbleDecision {
-	return synctestRunImpl(f, prefix)
+	return synctestRunImpl(f, prefix, false)
 }
 
-func synctestRunImpl(f func(), prefix []bubbleDecision) []bubbleDecision {
+//go:linkname synctestRunReplay internal/synctest.RunReplay
+func synctestRunReplay(f func(), trace []bubbleDecision) []bubbleDecision {
+	return synctestRunImpl(f, trace, true)
+}
+
+func synctestRunImpl(f func(), prefix []bubbleDecision, strict bool) []bubbleDecision {
+	if len(prefix) > bubbleMaxDecisions {
+		panic(synctestLimitError("prefix"))
+	}
 	if debug.asynctimerchan.Load() != 0 {
 		panic("synctest.Run not supported with asynctimerchan!=0")
 	}
@@ -322,32 +340,33 @@ func synctestRunImpl(f func(), prefix []bubbleDecision) []bubbleDecision {
 		panic("synctest.Run called from within a synctest bubble")
 	}
 	bubble := &synctestBubble{
-		id:      bubbleGen.Add(1),
-		total:   1,
-		running: 1,
-		root:    gp,
+		id:           bubbleGen.Add(1),
+		strictReplay: strict,
+		total:        1,
+		running:      1,
+		root:         gp,
 	}
 	const synctestBaseTime = 946684800000000000 // midnight UTC 2000-01-01
 	bubble.now = synctestBaseTime
 	lockInit(&bubble.mu, lockRankSynctest)
 	lockInit(&bubble.timers.mu, lockRankTimers)
 
-	// Allocate the decisions array via persistentalloc (non-GC, no pointers inside).
-	bubble.decisions = (*[bubbleMaxDecisions]bubbleDecision)(
-		persistentalloc(unsafe.Sizeof([bubbleMaxDecisions]bubbleDecision{}), 0, &memstats.other_sys))
+	// Allocate on the heap before any g0 scheduler access.
+	bubble.decisions = new([bubbleMaxDecisions]bubbleDecision)
 
 	// Load prefix into the decisions array before any goroutine runs.
 	if len(prefix) > 0 {
 		n := int32(len(prefix))
-		if n > bubbleMaxDecisions {
-			n = bubbleMaxDecisions
-		}
 		for i := int32(0); i < n; i++ {
 			bubble.decisions[i] = prefix[i]
 		}
 		bubble.decisionFence = n
 	}
 
+	// Membership and P binding must be one non-preemptible transition.
+	// A stack-check preemption between reading m.p and binding it would pin
+	// a stale P, allowing the root/target to escape the owner.
+	bindM := acquirem()
 	gp.bubble = bubble
 	gp.bubbleGid = 0 // root goroutine is B0
 	gp.bubbleSpawnPC = sys.GetCallerPC()
@@ -377,12 +396,18 @@ func synctestRunImpl(f func(), prefix []bubbleDecision) []bubbleDecision {
 		})
 		pp = gp.m.p.ptr()
 	}
+	lock(&pp.bubbleStealMu)
 	pp.bubble = bubble
 	bubble.pp = pp
+	unlock(&pp.bubbleStealMu)
 	defer func() {
+		unbindM := acquirem()
 		gp.bubble = nil
+		lock(&pp.bubbleStealMu)
 		pp.bubble = nil
 		bubble.pp = nil
+		unlock(&pp.bubbleStealMu)
+		releasem(unbindM)
 	}()
 
 	// Migrate any non-bubble goroutines from this P's local runq to the global
@@ -425,6 +450,8 @@ func synctestRunImpl(f func(), prefix []bubbleDecision) []bubbleDecision {
 		wakep()
 	})
 
+	releasem(bindM)
+
 	lock(&bubble.mu)
 	bubble.active++
 	for {
@@ -441,6 +468,12 @@ func synctestRunImpl(f func(), prefix []bubbleDecision) []bubbleDecision {
 
 		if bubble.signal == bubbleSignalReplayDiverged {
 			bubble.signal = bubbleSignalNone
+			if bubble.replayReason == 3 {
+				panic(synctestLimitError("decisions"))
+			}
+			if bubble.replayReason == 4 {
+				panic(synctestLimitError("runnable"))
+			}
 			panic(synctestReplayDivergenceError{
 				reason:   bubble.replayReason,
 				step:     bubble.replayStep,
@@ -462,6 +495,7 @@ func synctestRunImpl(f func(), prefix []bubbleDecision) []bubbleDecision {
 					blocked:      int32(bubble.total - bubble.running),
 					now:          bubble.now,
 					nextTimer:    bubble.timers.wakeTime(),
+					timerCount:   int32(bubble.timers.len.Load()),
 					lastBgid:     bubble.lastScheduledBgid,
 					external:     int32(bubble.external),
 					externalWait: int32(bubble.externalWait),
@@ -470,6 +504,7 @@ func synctestRunImpl(f func(), prefix []bubbleDecision) []bubbleDecision {
 					state.runnableBgid[i] = bubble.pendingRunq[i]
 					state.runnableGlob[i] = bubble.pendingGlob[i]
 				}
+				bubble.hookG = bubble.root
 				bubble.rootInHook = true
 				idx = bubble.onDecision(state)
 				bubble.rootInHook = false
@@ -493,10 +528,12 @@ func synctestRunImpl(f func(), prefix []bubbleDecision) []bubbleDecision {
 					idle:         true,
 					now:          bubble.now,
 					nextTimer:    bubble.timers.wakeTime(),
+					timerCount:   int32(bubble.timers.len.Load()),
 					lastBgid:     bubble.lastScheduledBgid,
 					external:     int32(bubble.external),
 					externalWait: int32(bubble.externalWait),
 				}
+				bubble.hookG = bubble.root
 				bubble.rootInHook = true
 				idx := bubble.onDecision(state)
 				bubble.rootInHook = false
@@ -525,7 +562,7 @@ func synctestRunImpl(f func(), prefix []bubbleDecision) []bubbleDecision {
 		// When a hook is set and no goroutines are pending on the runq, fire
 		// the idle hook. Hook users may either fully own idle/time behavior or
 		// return a negative value to delegate back to the default synctest
-		// idle/time logic for this iteration.
+		// idle/time logic until the next real frontier or ExternalWait idle event.
 		//
 		// The runqempty check prevents stranding: after a previous
 		// idle hook delivery, the bridge goroutine may be on the runq
@@ -538,11 +575,13 @@ func synctestRunImpl(f func(), prefix []bubbleDecision) []bubbleDecision {
 				idle:         true,
 				now:          bubble.now,
 				nextTimer:    bubble.timers.wakeTime(),
+				timerCount:   int32(bubble.timers.len.Load()),
 				lastBgid:     bubble.lastScheduledBgid,
 				external:     int32(bubble.external),
 				externalWait: int32(bubble.externalWait),
 			}
 			unlock(&bubble.mu)
+			bubble.hookG = bubble.root
 			bubble.rootInHook = true
 			idx := bubble.onDecision(state)
 			bubble.rootInHook = false
@@ -584,7 +623,7 @@ func synctestRunImpl(f func(), prefix []bubbleDecision) []bubbleDecision {
 			break
 		}
 		// Only auto-advance time when the idle hook did not claim ownership
-		// for this iteration.
+		// until the next real frontier or ExternalWait idle event.
 		if bubble.onDecision != nil && !delegateIdle {
 			continue
 		}
@@ -597,6 +636,9 @@ func synctestRunImpl(f func(), prefix []bubbleDecision) []bubbleDecision {
 		// Establish a happens-before relationship between bubbled goroutines exiting
 		// and Run returning.
 		raceacquireg(gp, gp.bubble.raceaddr())
+	}
+	if bubble.controlFailure != nil {
+		panic(bubble.controlFailure)
 	}
 	if total != 1 {
 		var reason string
@@ -613,7 +655,10 @@ func synctestRunImpl(f func(), prefix []bubbleDecision) []bubbleDecision {
 		throw("synctest root goroutine has a fake timer")
 	}
 
-	// Copy trace out of the bubble (persistentalloc memory → GC-managed slice).
+	// Copy the completed trace out of the bubble.
+	if strict && bubble.decisionLen != bubble.decisionFence {
+		panic(synctestReplayDivergenceError{reason: 5, step: bubble.decisionLen})
+	}
 	n := bubble.decisionLen
 	if n > 0 {
 		trace := make([]bubbleDecision, n)
@@ -624,6 +669,12 @@ func synctestRunImpl(f func(), prefix []bubbleDecision) []bubbleDecision {
 	}
 	return nil
 }
+
+// Limit reports which fixed runtime capacity was exceeded.
+type synctestLimitError string
+
+func (e synctestLimitError) Error() string { return "synctest resource limit: " + string(e) }
+func (e synctestLimitError) Limit() string { return string(e) }
 
 type synctestDeadlockError struct {
 	reason string
@@ -647,6 +698,8 @@ func (e synctestReplayDivergenceError) Error() string {
 		return "synctest replay divergence: hook-selected goroutine not runnable"
 	case 2:
 		return "synctest replay divergence: prefixed goroutine not runnable"
+	case 5:
+		return "synctest replay divergence: event mismatch or incomplete consumption"
 	default:
 		return "synctest replay divergence"
 	}
@@ -774,9 +827,10 @@ func synctestMarkGlobal() {
 func synctestIncExternal() {
 	gp := getg()
 	b := gp.bubble
-	if b == nil {
-		return
+	if b == nil || gp.bubbleExternal {
+		panic("synctest: external wrappers require a bubble and cannot nest")
 	}
+	gp.bubbleExternal = true
 	lock(&b.mu)
 	b.external++
 	unlock(&b.mu)
@@ -794,8 +848,12 @@ func synctestDecExternal() {
 	if b == nil {
 		return
 	}
+	gp.bubbleExternal = false
 	lock(&b.mu)
 	b.external--
+	if b.external < 0 {
+		throw("external < 0")
+	}
 	wake := b.maybeWakeLocked()
 	unlock(&b.mu)
 	if wake != nil {
@@ -812,9 +870,10 @@ func synctestDecExternal() {
 func synctestIncExternalWait() {
 	gp := getg()
 	b := gp.bubble
-	if b == nil {
-		return
+	if b == nil || gp.bubbleExternal {
+		panic("synctest: external wrappers require a bubble and cannot nest")
 	}
+	gp.bubbleExternal = true
 	lock(&b.mu)
 	b.externalWait++
 	unlock(&b.mu)
@@ -832,6 +891,7 @@ func synctestDecExternalWait() {
 	if b == nil {
 		return
 	}
+	gp.bubbleExternal = false
 	lock(&b.mu)
 	b.externalWait--
 	if b.externalWait < 0 {
@@ -904,6 +964,9 @@ func synctestReattachBubble() {
 	lock(&b.mu)
 	b.running++
 	unlock(&b.mu)
+	if getg().m.p.ptr() != b.pp {
+		Gosched()
+	}
 }
 
 // synctestGetDecisions returns a copy of the current bubble's decisions.
@@ -942,8 +1005,8 @@ func synctestSetDecisions(decisions []bubbleDecision) {
 	}
 	b := gp.bubble
 	n := int32(len(decisions))
-	if n > bubbleMaxDecisions {
-		n = bubbleMaxDecisions
+	if len(decisions) > bubbleMaxDecisions {
+		panic(synctestLimitError("prefix"))
 	}
 	for i := int32(0); i < n; i++ {
 		b.decisions[i] = decisions[i]

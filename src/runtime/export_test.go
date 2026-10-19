@@ -2083,3 +2083,30 @@ func DumpPrintQuoted(s string) string {
 
 	return string(buf)
 }
+
+// SynctestInSyscall observes syscall entry to order publication before handoff.
+func SynctestInSyscall(gp *G) bool { return readgstatus(gp)&^_Gscan == _Gsyscall }
+
+func SynctestIOWaiting(gp *G) bool {
+	return readgstatus(gp)&^_Gscan == _Gwaiting && gp.waitreason == waitReasonIOWait
+}
+
+func SynctestGCMarking() bool {
+	return atomic.Load(&gcBlackenEnabled) != 0
+}
+
+// Force the next allocation through the actual assist path, without changing
+// global GC policy, work queues, or the goroutine's scheduling state.
+func SynctestSetAssistDebt() { getg().gcAssistBytes = -1 << 30 }
+
+func SynctestAssistWaiting(gp *G) (waiting, home bool) {
+	if readgstatus(gp)&^_Gscan != _Gwaiting || !gp.inMarkAssist {
+		return false, false
+	}
+	return true, gp.bubble == nil && gp.bubbleHome != nil
+}
+
+func SynctestOnOwner() bool {
+	gp := getg()
+	return gp.bubble != nil && gp.bubbleHome == nil && gp.m.p.ptr() == gp.bubble.pp
+}

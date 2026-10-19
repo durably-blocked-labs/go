@@ -789,6 +789,10 @@ func bubbleFinishRecord(b *synctestBubble, gp *g, idx int32) {
 	}
 	d := &b.decisions[n]
 	d.step = n
+	d.kind = 0
+	d.site = 0
+	d.waitReason = b.yieldReason
+	b.yieldReason = 0
 	d.index = idx
 	d.chosenBgid = gp.bubbleGid
 	d.chosenSpawnPC = gp.bubbleSpawnPC
@@ -816,6 +820,29 @@ func bubbleReplayDiverged(b *synctestBubble, idx int32, reason uint8) (*g, bool,
 	}
 	casgstatus(b.root, _Gwaiting, _Grunnable)
 	return b.root, false, false
+}
+
+// bubbleTakeControl removes an already-runnable control goroutine without
+// recording a target scheduling event. Only the owner P scans/mutates runq.
+func bubbleTakeControl(pp *p, control *g) (*g, bool) {
+	if control == nil {
+		return nil, false
+	}
+	pos := int32(0)
+	if next := pp.runnext; next != 0 {
+		if next.ptr() == control {
+			return runqpick(pp, 0)
+		}
+		pos++
+	}
+	h, t := atomic.LoadAcq(&pp.runqhead), pp.runqtail
+	for i := h; i < t; i++ {
+		if pp.runq[i%uint32(len(pp.runq))].ptr() == control {
+			return runqpick(pp, pos)
+		}
+		pos++
+	}
+	return nil, false
 }
 
 // runqpick removes the n-th goroutine from pp's local run queue.
@@ -1253,22 +1280,23 @@ func ready(gp *g, traceskip int, next bool) {
 	if gpBubble == nil {
 		gpBubble = gp.bubbleHome
 	}
-	if gpBubble != nil && gp == gpBubble.root && gpBubble.rootInHook {
+	if gpBubble != nil && gp == gpBubble.hookG && gpBubble.rootInHook {
 		// A resumed bubble root must land in runnext while the scheduler is
 		// paused in the rootInHook loop below. That loop only checks runnext,
 		// so same-P wakeups need the same treatment as cross-P wakeups.
 		next = true
 	}
 	if gpBubble != nil && gpBubble.pp != nil && gpBubble.pp != pp {
-		pp = gpBubble.pp
-		// When waking root during rootInHook (orchestrator responded on channel),
-		// use runnext so findRunnable can pick it up immediately without scanning
-		// the circular buffer. For other bubble goroutines, don't displace runnext.
-		if gp == gpBubble.root && gpBubble.rootInHook {
-			next = true
-		} else {
-			next = false // don't displace runnext on a different P
-		}
+		// Never write another P's runq/runnext. The bubble P stays serviced
+		// while it owns external work, including across STW restart.
+		lock(&gpBubble.mu)
+		gpBubble.inbound.pushBack(gp)
+		waiters := synctestReadyRegistered(gp)
+		unlock(&gpBubble.mu)
+		synctestWakeReady(waiters)
+		wakep()
+		releasem(mp)
+		return
 	} else if gpBubble == nil && pp.bubble != nil {
 		// Non-bubble goroutine woken from bubble context (e.g., bubble root sends
 		// on channel to orchestrator). Don't strand it on the bubble's P — the
@@ -1281,6 +1309,7 @@ func ready(gp *g, traceskip int, next bool) {
 		return
 	}
 	runqput(pp, gp, next)
+	synctestWakeReady(synctestReadyRegistered(gp))
 	wakep()
 	releasem(mp)
 }
@@ -3278,6 +3307,25 @@ func handoffp(pp *p) {
 	// handoffp must start an M in any situation where
 	// findRunnable would return a G to run on pp.
 
+	// A bubble P owns its inbound queue even while its target is in a
+	// syscall or on a locked M. It must never enter the generic idle pool:
+	// wakep is not targeted and cannot guarantee that this P is reacquired.
+	if pp.bubble != nil {
+		lock(&sched.lock)
+		if sched.gcwaiting.Load() {
+			pp.status = _Pgcstop
+			pp.gcStopTime = nanotime()
+			sched.stopwait--
+			if sched.stopwait == 0 {
+				notewakeup(&sched.stopnote)
+			}
+		} else {
+			startm(pp, false, true)
+		}
+		unlock(&sched.lock)
+		return
+	}
+
 	// if it has local work, start it straight away
 	if !runqempty(pp) || !sched.runq.empty() {
 		startm(pp, false, false)
@@ -3477,6 +3525,19 @@ func gcstopm() {
 func execute(gp *g, inheritTime bool) {
 	mp := getg().m
 
+	b := gp.bubble
+	if b == nil {
+		b = gp.bubbleHome
+	}
+	if b != nil && b.pp != nil {
+		if mp.p.ptr() != b.pp {
+			throw("synctest: target executed on foreign P")
+		}
+		if b.rootInHook && gp != b.hookG {
+			throw("synctest: target executed during suspended hook")
+		}
+	}
+
 	if goroutineProfile.active {
 		// Make sure that gp has had its stack written out to the goroutine
 		// profile, exactly as it was when the goroutine profiler first stopped
@@ -3616,6 +3677,48 @@ top:
 		asmcgocall(*cgo_yield, nil)
 	}
 
+	// Drain foreign wakeups on the owner P only. Root has priority while
+	// suspended in a hook; other goroutines remain queued, not executed.
+	if b := pp.bubble; b != nil {
+		lock(&b.mu)
+		q := b.inbound
+		b.inbound = gQueue{}
+		unlock(&b.mu)
+		for !q.empty() {
+			gp := q.pop()
+			runqput(pp, gp, gp == b.hookG && b.rootInHook)
+		}
+		if b.rootInHook {
+			if gp, inherit := bubbleTakeControl(pp, b.hookG); gp != nil {
+				return gp, inherit, false
+			}
+			osyield()
+			goto top
+		}
+		// maybeWakeLocked may have already made root runnable. Run control
+		// work before consulting a frontier, never treat root as a target
+		// candidate or let its transient runnable state bypass the hook.
+		if gp, inherit := bubbleTakeControl(pp, b.root); gp != nil {
+			return gp, inherit, false
+		}
+
+		if !runqempty(pp) {
+			n := int32(pp.runqtail - atomic.LoadAcq(&pp.runqhead))
+			if pp.runnext != 0 {
+				n++
+			}
+			if n > bubbleMaxRunq {
+				return bubbleReplayDiverged(b, -1, 4)
+			}
+			if b.decisionLen >= bubbleMaxDecisions {
+				return bubbleReplayDiverged(b, -1, 3)
+			}
+			if b.strictReplay && b.decisionLen >= b.decisionFence {
+				return bubbleReplayDiverged(b, -1, 5)
+			}
+		}
+	}
+
 	// Bubble: decision-ready — root has decided, pick the chosen goroutine.
 	if b := pp.bubble; b != nil && b.decisionReady {
 		b.decisionReady = false
@@ -3631,7 +3734,25 @@ top:
 	// Bubble: follow pre-loaded decisions before default runqget.
 	if b := pp.bubble; b != nil && b.decisions != nil && b.decisionLen < b.decisionFence {
 		d := &b.decisions[b.decisionLen] // pre-loaded decision at current step
+		expected := *d
+		if expected.kind != 0 {
+			return bubbleReplayDiverged(b, expected.index, 5)
+		}
 		bubblePreSnapshot(pp, b)
+		if b.strictReplay {
+			actual := *d
+			if expected.waitReason != b.yieldReason || expected.site != 0 || expected.step != b.decisionLen || expected.runqSize != actual.runqSize || expected.index < 0 || expected.index >= actual.runqSize {
+				return bubbleReplayDiverged(b, expected.index, 5)
+			}
+			for i := int32(0); i < actual.runqSize; i++ {
+				if expected.runqBgids[i] != actual.runqBgids[i] {
+					return bubbleReplayDiverged(b, expected.index, 5)
+				}
+			}
+			if expected.chosenBgid != actual.runqBgids[expected.index] {
+				return bubbleReplayDiverged(b, expected.index, 5)
+			}
+		}
 		gp, inheritTime := runqpick(pp, d.index)
 		if gp != nil {
 			bubbleFinishRecord(b, gp, d.index)
@@ -3699,26 +3820,6 @@ top:
 		}
 	}
 
-	// Bubble: hook is blocking on external I/O — pause the bubble.
-	// When rootInHook is true, the root goroutine is executing the onDecision
-	// hook, which is blocking (e.g., waiting for orchestrator response on a
-	// channel). User goroutines must not run until the hook returns a decision.
-	// Only pick root from runnext so it can finish the hook and set decisionReady.
-	//
-	// We use a tight inner loop instead of goto top to avoid gcstopm releasing
-	// the bubble P during GC (which would orphan it). The spin is brief — the
-	// orchestrator typically responds within microseconds via a channel.
-	if b := pp.bubble; b != nil && b.rootInHook {
-		for {
-			if next := pp.runnext; next != 0 && next.ptr() == b.root {
-				if pp.runnext.cas(next, 0) {
-					return b.root, true, false
-				}
-			}
-			osyield()
-		}
-	}
-
 	// local runq
 	if b := pp.bubble; b != nil {
 		bubblePreSnapshot(pp, b)
@@ -3730,19 +3831,19 @@ top:
 		return gp, inheritTime, false
 	}
 
-		// Bubble: external goroutines pending — keep P, but back off while waiting.
-		// When external > 0 or externalWait > 0, goroutines are blocked on
-		// external channels (e.g., redis call, orchestrator channel). Cross-P
-		// goready will deposit the woken goroutine on our runq. Avoid a pure
-		// osyield spin here: distributed exploration can sit in this state for
-		// thousands of short waits, which otherwise burns CPU without helping the
-		// wakeup arrive any sooner.
-		if b := pp.bubble; b != nil && (b.external > 0 || b.externalWait > 0) && runqempty(pp) {
-			osyield()
-			goto top
-		}
+	// Bubble: external goroutines pending — keep P, but back off while waiting.
+	// When external > 0 or externalWait > 0, goroutines are blocked on
+	// external channels (e.g., redis call, orchestrator channel). Cross-P
+	// goready will deposit the woken goroutine on our runq. Avoid a pure
+	// osyield spin here: distributed exploration can sit in this state for
+	// thousands of short waits, which otherwise burns CPU without helping the
+	// wakeup arrive any sooner.
+	if b := pp.bubble; b != nil && (b.external > 0 || b.externalWait > 0) && runqempty(pp) {
+		osyield()
+		goto top
+	}
 
-		// global runq
+	// global runq
 	// Skip for bubble Ps: bubble goroutines must stay local.
 	if pp.bubble == nil && !sched.runq.empty() {
 		lock(&sched.lock)
@@ -3770,6 +3871,12 @@ top:
 		sched.pollingNet.Store(0)
 		if !list.empty() { // non-blocking
 			gp := list.pop()
+			if gp.bubble != nil || gp.bubbleHome != nil {
+				list.push(gp)
+				injectglist(&list)
+				netpollAdjustWaiters(delta)
+				goto top
+			}
 			injectglist(&list)
 			netpollAdjustWaiters(delta)
 			trace := traceAcquire()
@@ -3899,12 +4006,12 @@ top:
 	// reliably re-acquire a specific P. If we release, the goroutine is
 	// orphaned — no M will process the bubble P's runq. Spin-wait instead;
 	// cross-P goready or maybeWakeLocked will deposit work shortly.
-		if pp.bubble != nil {
-			unlock(&sched.lock)
-			osyield()
-			goto top
-		}
-		if releasep() != pp {
+	if pp.bubble != nil {
+		unlock(&sched.lock)
+		osyield()
+		goto top
+	}
+	if releasep() != pp {
 		throw("findRunnable: wrong p")
 	}
 	now = pidleput(pp, now)
@@ -4063,6 +4170,12 @@ top:
 			acquirep(pp)
 			if !list.empty() {
 				gp := list.pop()
+				if gp.bubble != nil || gp.bubbleHome != nil {
+					list.push(gp)
+					injectglist(&list)
+					netpollAdjustWaiters(delta)
+					goto top
+				}
 				injectglist(&list)
 				netpollAdjustWaiters(delta)
 				trace := traceAcquire()
@@ -4366,6 +4479,29 @@ func injectglist(glist *gList) {
 	q := gQueue{glist.head, tail.guintptr(), glist.size}
 	*glist = gList{}
 
+	// Netpoll/sysmon injection can run without a P. Keep bubbled goroutines
+	// off both the global queue and arbitrary local queues; their active P
+	// remains serviced by handoffp and STW restart.
+	var ordinary gQueue
+	for !q.empty() {
+		gp := q.pop()
+		b := gp.bubble
+		if b == nil {
+			b = gp.bubbleHome
+		}
+		if b != nil {
+			lock(&b.mu)
+			b.inbound.pushBack(gp)
+			unlock(&b.mu)
+		} else {
+			ordinary.pushBack(gp)
+		}
+	}
+	q = ordinary
+	if q.empty() {
+		return
+	}
+
 	startIdle := func(n int32) {
 		for ; n > 0; n-- {
 			mp := acquirem() // See comment in startm.
@@ -4632,10 +4768,28 @@ func goschedImpl(gp *g, preempted bool) {
 		// If preempted for STW, keep the G on the local P in runnext
 		// so it can keep running immediately after the STW.
 		runqput(pp, gp, true)
-	} else if gp.bubble != nil {
+	} else if gp.bubble != nil || gp.bubbleHome != nil {
 		// Bubble goroutines must stay on their bubble P.
 		// Don't put them on the global runq where other Ps could steal them.
-		runqput(pp, gp, false)
+		b := gp.bubble
+		if b == nil {
+			b = gp.bubbleHome
+		}
+		if b.pp != pp {
+			lock(&b.mu)
+			b.inbound.pushBack(gp)
+			var waiters gQueue
+			if gp.bubbleReadyFinish {
+				waiters = synctestReadyRegistered(gp)
+			}
+			unlock(&b.mu)
+			synctestWakeReady(waiters)
+		} else {
+			runqput(pp, gp, false)
+			if gp.bubbleReadyFinish {
+				synctestWakeReady(synctestReadyRegistered(gp))
+			}
+		}
 	} else {
 		lock(&sched.lock)
 		globrunqput(gp)
@@ -5345,6 +5499,12 @@ func exitsyscallTryGetP(oldp *p) *p {
 		}
 	}
 
+	if gp := getg().m.curg; gp != nil && (gp.bubble != nil || gp.bubbleHome != nil) {
+		// A returning target must queue on its own P, never execute on an
+		// arbitrary idle P while its bubble is suspended.
+		return nil
+	}
+
 	// Try to get an idle P.
 	if sched.pidle != 0 {
 		lock(&sched.lock)
@@ -5383,6 +5543,26 @@ func exitsyscallNoP(gp *g) {
 	}
 	decGSyscallNoP(getg().m)
 	dropg()
+	b := gp.bubble
+	if b == nil {
+		b = gp.bubbleHome
+	}
+	if b != nil {
+		lock(&b.mu)
+		b.inbound.pushBack(gp)
+		// Unlocking publishes gp to its owner, which may immediately run it
+		// on another M and change lockedm. Snapshot before releasing ownership.
+		locked := gp.lockedm != 0
+		unlock(&b.mu)
+		if locked {
+			stoplockedm()
+			execute(gp, false)
+		}
+		stopm()
+		schedule()
+		throw("synctest: syscall scheduler returned")
+	}
+
 	lock(&sched.lock)
 	var pp *p
 	if schedEnabled(gp) {
@@ -5603,7 +5783,13 @@ func newproc(fn *funcval) {
 		newg := newproc1(fn, gp, pc, false, waitReasonZero)
 
 		pp := getg().m.p.ptr()
-		runqput(pp, newg, true)
+		if pp.bubble != nil && newg.bubble == nil {
+			lock(&sched.lock)
+			globrunqput(newg)
+			unlock(&sched.lock)
+		} else {
+			runqput(pp, newg, true)
+		}
 
 		if mainStarted {
 			wakep()
@@ -6240,6 +6426,7 @@ func (pp *p) init(id int32) {
 		}
 	}
 	lockInit(&pp.timers.mu, lockRankTimers)
+	lockInit(&pp.bubbleStealMu, lockRankLeafRank)
 
 	// This P may get timers when it starts running. Set the mask here
 	// since the P may not go through pidleget (notably P 0 on startup).
@@ -6337,6 +6524,13 @@ func (pp *p) destroy() {
 //
 // Returns list of Ps with local work, they need to be scheduled by the caller.
 func procresize(nprocs int32) *p {
+	if nprocs != gomaxprocs {
+		for _, pp := range allp {
+			if pp.bubble != nil {
+				throw("synctest: GOMAXPROCS change with active bubble")
+			}
+		}
+	}
 	assertLockHeld(&sched.lock)
 	assertWorldStopped()
 
@@ -6453,7 +6647,7 @@ func procresize(nprocs int32) *p {
 			continue
 		}
 		pp.status = _Pidle
-		if runqempty(pp) {
+		if runqempty(pp) && pp.bubble == nil {
 			pp.link.set(idlePs)
 			idlePs = pp
 			continue
@@ -7834,7 +8028,7 @@ func runqputslow(pp *p, gp *g, h, t uint32) bool {
 	// Bubble Ps must not overflow goroutines to the global runq.
 	// If we hit this, the bubble has >256 runnable goroutines — not supported (single-P limit).
 	if pp.bubble != nil {
-		throw("synctest bubble: runq overflow (too many runnable goroutines for single-P bubble)")
+		throw("synctest resource limit: physical runqueue (worker must terminate)")
 	}
 
 	var batch [len(pp.runq)/2 + 1]*g
@@ -7975,6 +8169,11 @@ retry:
 // Returns number of grabbed goroutines.
 // Can be executed by any P.
 func runqgrab(pp *p, batch *[256]guintptr, batchHead uint32, stealRunNextG bool) uint32 {
+	lock(&pp.bubbleStealMu)
+	defer unlock(&pp.bubbleStealMu)
+	if pp.bubble != nil {
+		return 0
+	}
 	for {
 		h := atomic.LoadAcq(&pp.runqhead) // load-acquire, synchronize with other consumers
 		t := atomic.LoadAcq(&pp.runqtail) // load-acquire, synchronize with the producer

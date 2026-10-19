@@ -12,7 +12,12 @@ import (
 	"unsafe"
 )
 
-// Decision records one scheduling decision within a bubble.
+// Decision records one event within a bubble. Kind 0 is a schedule event:
+// Index indexes ordered RunqBgids; ChosenBgid is the chosen goroutine. Kind 1
+// is an initially enabled select event: Index is the runtime case index,
+// RunqBgids encodes case index+1 (zero = default), ChosenBgid is the actor,
+// and Site is the main-text-relative caller PC. ChosenSpawnPC is diagnostic
+// only, process-local, and NOT a portable replay identity.
 // Layout must match runtime.bubbleDecision exactly.
 type Decision struct {
 	Index         int32
@@ -21,7 +26,11 @@ type Decision struct {
 	RunqSize      int32
 	RunqBgids     [16]uint32
 	Step          int32
-	WaitReason    uint8
+	// WaitReason is 255 for explicit Yield, otherwise reserved zero.
+	// It does not count preemptions.
+	WaitReason uint8
+	Kind       uint8
+	Site       uintptr
 }
 
 // BubbleState describes the state of a bubble at a scheduling decision point.
@@ -34,6 +43,7 @@ type BubbleState struct {
 	Blocked      int32
 	Idle         bool
 	Now          int64
+	// TimerCount counts heap entries, including timers pending removal.
 	TimerCount   int32
 	NextTimer    int64
 	LastBgid     uint32
@@ -49,6 +59,9 @@ func Run(f func())
 //
 //go:linkname RunExplore
 func RunExplore(f func(), prefix []Decision) []Decision
+
+//go:linkname RunReplay
+func RunReplay(f func(), trace []Decision) []Decision
 
 //go:linkname Wait
 func Wait()
@@ -116,9 +129,8 @@ func SetTime(t int64)
 func External(fn func()) {
 	incExternal()
 	detachBubble()
+	defer func() { reattachBubble(); decExternal() }()
 	fn()
-	reattachBubble()
-	decExternal()
 }
 
 // CallExternal marks the current goroutine as global and wraps fn
@@ -129,10 +141,10 @@ func External(fn func()) {
 // Use CallExternal for operations the orchestrator should intercept
 // (e.g., RPC send/receive, inbox listen).
 func CallExternal(fn func()) {
-	MarkGlobal()
 	incExternal()
+	defer decExternal()
+	MarkGlobal()
 	fn()
-	decExternal()
 }
 
 // ExternalWait wraps fn with the externalWait counter AND detaches the
@@ -150,9 +162,8 @@ func CallExternal(fn func()) {
 func ExternalWait(fn func()) {
 	incExternalWait()
 	detachBubble()
+	defer func() { reattachBubble(); decExternalWait() }()
 	fn()
-	reattachBubble()
-	decExternalWait()
 }
 
 // IsInBubble reports whether the current goroutine is in a bubble.
@@ -240,3 +251,60 @@ func (b *Bubble) Run(f func()) {
 		inBubble(b.b, f)
 	}
 }
+
+// Ready is a one-use acknowledgement of owned runnable registration. It is
+// not an acknowledgement that the callback or application work has completed.
+// Create it with NewReady; the zero value is invalid.
+type Ready struct{ token any }
+
+func NewReady() *Ready       { return &Ready{token: newReady()} }
+func (r *Ready) Ready() bool { return readyDone(r.token) }
+
+// Wait parks the coordinator until registration. Call only outside a bubble.
+func (r *Ready) Wait() { readyWait(r.token) }
+
+// ExternalWaitReady is ExternalWait with a one-use owner-registration token.
+// fn must perform one logical receive/close operation, not unrelated blocking
+// work: the first wake acknowledges registration. For an immediate operation,
+// wrapper exit cooperatively registers before returning to ordinary target code.
+// Wait does not require the target to resume or finish its callback.
+func ExternalWaitReady(fn func(), r *Ready) {
+	incExternalWait()
+	defer decExternalWait()
+	armReady(r.token)
+	detachBubble()
+	defer func() { reattachBubble(); finishReady() }()
+	fn()
+}
+
+//go:linkname newReady
+func newReady() any
+
+//go:linkname readyDone
+func readyDone(any) bool
+
+//go:linkname readyWait
+func readyWait(any)
+
+//go:linkname armReady
+func armReady(any)
+
+//go:linkname finishReady
+func finishReady()
+
+// SelectState describes initially enabled selectgo cases. Cases are runtime
+// indices (send partition followed by receives), not source-case ordinals.
+// -1 is default. Site is a main-module-relative PC in the exact pinned binary.
+type SelectState struct {
+	Step      int32
+	Goroutine uint32
+	Site      uintptr
+	CaseN     int32
+	Cases     [16]int32
+}
+
+//go:linkname SetSelectHook
+func SetSelectHook(func(SelectState) int32)
+
+//go:linkname Yield
+func Yield()

@@ -271,7 +271,10 @@ import (
 	_ "unsafe" // for linkname
 )
 
-// Decision is a scheduling decision recorded within a bubble.
+// Decision records a schedule (Kind=0) or opt-in initially enabled select
+// (Kind=1). For select, Index is a runtime case index, RunqBgids encodes case
+// index+1 (zero = default), ChosenBgid is the actor, Site is main-text-relative.
+// ChosenSpawnPC is process-local diagnostic information, not replay identity.
 type Decision = synctest.Decision
 
 // BubbleState describes the state of a bubble at a scheduling decision point.
@@ -320,19 +323,64 @@ func testingSynctestTest(t *testing.T, f func(*testing.T)) bool
 // the scheduling trace and whether the test passed.
 // Unlike Test, Explore does not call t.FailNow() on failure,
 // allowing the caller (e.g., an explorer) to handle failures.
-// If the bubble panics (e.g., deadlock), returns (nil, false).
+// If the root panics (e.g., deadlock), returns (nil, false). Such a result
+// makes the worker process unsafe to reuse. Prefer ExploreResult for the cause.
 func Explore(t *testing.T, f func(*testing.T), prefix []Decision) (trace []Decision, ok bool) {
+	r := ExploreResult(t, f, prefix)
+	return r.Trace, r.OK
+}
+
+// Fixed capacities of the experimental runtime. Capacity exhaustion fails closed.
+const (
+	MaxDecisions        = 512
+	MaxRunnable         = 16
+	MaxSelectCases      = 16
+	DecisionSchedule    = 0
+	DecisionSelectReady = 1
+	WaitReasonYield     = 255
+)
+
+// Result describes a completed exploration or strict replay. Cause retains a
+// recovered root panic (including errors implementing Limit() string).
+// WorkerUnsafe means the process MUST NOT execute another trial: recovering
+// a panic does not cancel or join surviving goroutines. Dispose of the process.
+// Fatal runtime throws cannot be recovered and terminate the process directly.
+type Result struct {
+	Trace        []Decision
+	OK           bool
+	Cause        any
+	WorkerUnsafe bool
+}
+
+// ExploreResult follows a positional exploration prefix, then records new
+// choices. Unlike strict replay, prefixes intentionally do not assert identity.
+func ExploreResult(t *testing.T, f func(*testing.T), prefix []Decision) Result {
+	return runResult(t, f, prefix, false)
+}
+
+// StrictReplay requires the exact ordered runnable identities and chosen
+// identity at every event, and complete trace consumption. It is distinct from
+// exploration. Trace PCs are process-local; portable source identity and final
+// application outcome must additionally be checked by the worker harness.
+func StrictReplay(t *testing.T, f func(*testing.T), trace []Decision) Result {
+	return runResult(t, f, trace, true)
+}
+
+func runResult(t *testing.T, f func(*testing.T), prefix []Decision, strict bool) (r Result) {
 	defer func() {
-		if r := recover(); r != nil {
-			ok = false
+		if cause := recover(); cause != nil {
+			r.OK = false
+			r.Cause = cause
+			r.WorkerUnsafe = true
 		}
 	}()
-	var innerOK bool
-	trace = synctest.RunExplore(func() {
-		innerOK = testingSynctestTest(t, f)
-	}, prefix)
-	ok = innerOK
-	return
+	f0 := func() { r.OK = testingSynctestTest(t, f) }
+	if strict {
+		r.Trace = synctest.RunReplay(f0, prefix)
+	} else {
+		r.Trace = synctest.RunExplore(f0, prefix)
+	}
+	return r
 }
 
 // SetDecisionHook registers a function that is called at each frontier
@@ -340,7 +388,8 @@ func Explore(t *testing.T, f func(*testing.T), prefix []Decision) (trace []Decis
 // the bubble state (runnable goroutines, blocked count, fake time, etc.)
 // and returns the index of the goroutine to schedule next (0 = FIFO default).
 // When state.Idle is true, returning a negative value delegates back to the
-// default synctest idle/time handling for that iteration.
+// default synctest idle/time handling until a real frontier or ExternalWait idle
+// event reclaims control (including across transient wakeups).
 //
 // SetDecisionHook must be called from within a bubble.
 // Passing nil restores the default FIFO scheduling.
@@ -366,7 +415,8 @@ func MarkGlobal() {
 // Use this for external operations (e.g., redis calls) that need the
 // bubble to park but should not be forwarded to the orchestrator.
 //
-// External must be called from within a bubble.
+// External must be called from within a bubble. External wrappers cannot nest;
+// state is restored on return, panic, and runtime.Goexit.
 func External(fn func()) {
 	synctest.External(fn)
 }
@@ -426,3 +476,45 @@ func SetTime(t int64) {
 func Wait() {
 	synctest.Wait()
 }
+
+// Ready acknowledges owned runnable registration, NOT callback completion.
+// The token is one-use; its zero value is invalid. Ready.Wait must be called
+// outside a bubble and safely parks until registration, without polling.
+type Ready = synctest.Ready
+
+func NewReady() *Ready { return synctest.NewReady() }
+
+// ExternalWaitReady performs one logical receive/close callback and acknowledges
+// its owner-queue registration with r. No unrelated blocking work may occur in
+// fn: its first wake signals r. An immediate/nonparking callback cooperatively
+// queues on exit. Acknowledgement does not require application execution while
+// the bubble is suspended. Reuse or nested external wrappers panic.
+func ExternalWaitReady(fn func(), r *Ready) { synctest.ExternalWaitReady(fn, r) }
+
+// SelectState describes enabled runtime cases, including -1 for default.
+// Cases are runtime send/receive partition indices, NOT source-case ordinals.
+// Site is relative to the main text module; replay requires the identical binary.
+type SelectState = synctest.SelectState
+
+// SetSelectHook opts into explicit initially enabled selectgo case choices.
+// The hook returns a runtime case index from state.Cases[:state.CaseN], NOT an
+// array offset. It runs outside channel locks, with ordinary target execution
+// suspended. Readiness is revalidated under locks before committing; changed
+// enabled sets fail closed. nil restores ordinary randomized select behavior
+// and schedule-only traces. Only bubble-owned channels are supported (nil is
+// ignored); closed sends remain eligible and panic normally if selected.
+//
+// Compiler-lowered selects (zero/one case and single-case-plus-default) do not
+// call selectgo and are NOT controlled or recorded. reflect.Select and sites
+// outside the main text module are rejected while control is enabled. A select
+// that initially blocks has no explicit case event: its winning wake remains
+// determined by controlled scheduling and channel operations. Case limits apply
+// to all syntactic runtime cases, including nil cases. Hooks must not nest a
+// controlled select. This is cooperative control, not arbitrary preemption.
+func SetSelectHook(hook func(SelectState) int32) { synctest.SetSelectHook(hook) }
+
+// Yield is a cooperative scheduling point equivalent to runtime.Gosched inside
+// a target bubble goroutine. The next schedule records WaitReason=255. The
+// yielding goroutine may legally be selected immediately; no fairness or
+// preemption bound is implied. It must not be called from a decision hook.
+func Yield() { synctest.Yield() }

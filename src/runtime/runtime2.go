@@ -577,10 +577,13 @@ type g struct {
 	// Deterministic bubble-local goroutine ID and spawn location.
 	// bubbleGid is assigned sequentially within a bubble (0 = entrypoint).
 	// bubbleSpawnPC is the PC of the "go" statement that created this goroutine.
-	bubbleGid     uint32
-	bubbleSpawnPC uintptr
-	bubbleGlobal  bool              // true if marked as global (scheduling decisions forwarded to orchestrator)
-	bubbleHome    *synctestBubble  // saved bubble during External (gp.bubble is nil while external)
+	bubbleGid         uint32
+	bubbleSpawnPC     uintptr
+	bubbleGlobal      bool            // true if marked as global (scheduling decisions forwarded to orchestrator)
+	bubbleReady       *synctestReady  // one-use external owner-registration acknowledgement
+	bubbleReadyFinish bool            // nonparking callback needs cooperative registration
+	bubbleExternal    bool            // external wrapper active; nesting is rejected
+	bubbleHome        *synctestBubble // saved bubble during External (gp.bubble is nil while external)
 
 	// xRegs stores the extended register state if this G has been
 	// asynchronously preempted.
@@ -829,7 +832,8 @@ type p struct {
 	// bubble is non-nil when this P is dedicated to a synctest bubble.
 	// Set in synctestRun, cleared on exit. Used by findRunnable to
 	// follow/record scheduling decisions.
-	bubble *synctestBubble
+	bubble        *synctestBubble
+	bubbleStealMu mutex // excludes runqgrab during bubble binding/unbinding
 
 	// Available G's (status == Gdead)
 	gFree gList
@@ -1409,9 +1413,6 @@ var isIdleInSynctest = [len(waitReasonStrings)]bool{
 	waitReasonSynctestChanReceive:   true,
 	waitReasonSynctestChanSend:      true,
 	waitReasonSynctestSelect:        true,
-	waitReasonSyncMutexLock:         true,
-	waitReasonSyncRWMutexRLock:      true,
-	waitReasonSyncRWMutexLock:       true,
 }
 
 var (

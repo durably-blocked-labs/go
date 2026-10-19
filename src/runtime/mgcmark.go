@@ -511,9 +511,14 @@ func gcAssistAlloc(gp *g) {
 		// This is less elegant than incrementing the group's active count,
 		// but avoids any contamination between GC assist and synctest.
 		bubble := gp.bubble
+		home := gp.bubbleHome
+		// Keep scheduler ownership while disassociated for GC accounting:
+		// assists can yield or park and must resume on the bubble's P.
+		gp.bubbleHome = bubble
 		gp.bubble = nil
 		defer func() {
 			gp.bubble = bubble
+			gp.bubbleHome = home
 		}()
 	}
 

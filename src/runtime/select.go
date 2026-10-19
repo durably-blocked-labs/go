@@ -121,6 +121,7 @@ func block() {
 // a value was received.
 func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, block bool) (int, bool) {
 	gp := getg()
+	selectPC := sys.GetCallerPC()
 	if debugSelect {
 		print("select: cas0=", cas0, "\n")
 	}
@@ -131,6 +132,10 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 	order1 := (*[1 << 17]uint16)(unsafe.Pointer(order0))
 
 	ncases := nsends + nrecvs
+	controlled := gp.bubble != nil && gp.bubble.onSelect != nil
+	if controlled && ncases > bubbleMaxRunq {
+		synctestSelectFail(gp.bubble, "synctest resource limit: select cases")
+	}
 	scases := cas1[:ncases:ncases]
 	pollorder := order1[:ncases:ncases]
 	lockorder := order1[ncases:][:ncases:ncases]
@@ -188,13 +193,20 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 			cas.c.timer.maybeRunChan(cas.c)
 		}
 
-		j := cheaprandn(uint32(norder + 1))
+		j := uint32(norder)
+		if !controlled {
+			j = cheaprandn(uint32(norder + 1))
+		}
 		pollorder[norder] = pollorder[j]
 		pollorder[j] = uint16(i)
 		norder++
 	}
 	pollorder = pollorder[:norder]
 	lockorder = lockorder[:norder]
+
+	if controlled && !allSynctest {
+		synctestSelectFail(gp.bubble, "synctest: controlled select requires bubble-owned channels")
+	}
 
 	waitReason := waitReasonSelect
 	if gp.bubble != nil && allSynctest {
@@ -260,6 +272,39 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 		qp     unsafe.Pointer
 		nextp  **sudog
 	)
+
+	// Snapshot under locks, consult user code with NO channel locks held, then
+	// revalidate the entire enabled set under locks before selecting one case.
+	// A waiting select is still resolved by its waking channel operation; only
+	// initially enabled choices (including default) are explicit select events.
+	if controlled {
+		state := bubbleSelectState{step: gp.bubble.decisionLen, goroutine: gp.bubbleGid, site: selectPC}
+		synctestSelectEnabled(&state, scases, nsends, block)
+		if state.caseN != 0 {
+			selunlock(scases, lockorder)
+			chosen := synctestSelectChoice(gp.bubble, state)
+			sellock(scases, lockorder)
+			actual := bubbleSelectState{}
+			synctestSelectEnabled(&actual, scases, nsends, block)
+			valid := actual.caseN == state.caseN
+			for i := int32(0); i < state.caseN; i++ {
+				if actual.cases[i] != state.cases[i] {
+					valid = false
+				}
+			}
+			if !valid {
+				selunlock(scases, lockorder)
+				synctestSelectFail(gp.bubble, "synctest: stale enabled select set")
+			}
+			// Single-case polling reserves/dequeues only the chosen operation.
+			if chosen == -1 {
+				pollorder = pollorder[:0]
+			} else {
+				pollorder = pollorder[:1]
+				pollorder[0] = uint16(chosen)
+			}
+		}
+	}
 
 	// pass 1 - look for something already waiting
 	var casi int
@@ -567,6 +612,9 @@ const (
 
 //go:linkname reflect_rselect reflect.rselect
 func reflect_rselect(cases []runtimeSelect) (int, bool) {
+	if b := getg().bubble; b != nil && b.onSelect != nil {
+		synctestSelectFail(b, "synctest: reflect.Select unsupported with select control")
+	}
 	if len(cases) == 0 {
 		block()
 	}
