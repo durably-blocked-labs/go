@@ -7,6 +7,30 @@
 // The [Test] function runs a function in an isolated "bubble".
 // Any goroutines started within the bubble are also part of the bubble.
 //
+// # Bubbles execution policy
+//
+// This fork explores cooperative schedules. Once a goroutine is selected, it
+// continues until it blocks, explicitly yields, or finishes. Runtime time-slice
+// preemption, stop-the-world pauses, stack scans, and scoped GC-internal waits
+// resume that same continuation before selecting an application peer. Explicit
+// application calls to runtime.Gosched remain scheduling boundaries. A public
+// runtime.GC call can still block while it waits for collection to finish.
+//
+// Tests must not rely on time-slice preemption to let a peer make progress.
+// For example, a goroutine spinning on a flag from a queued peer can starve it.
+// Source function boundaries do not automatically create scheduling choices.
+// This fork does not represent all legal Go interleavings or establish fairness.
+//
+// Keep the processor topology fixed while bubbles are active. Each bubble owns
+// one P, and GC requires at least one additional P for host/runtime work. Set
+// GOMAXPROCS before starting bubbles, with capacity for all simultaneous bubbles
+// plus one host P, and keep that host capacity available throughout the run.
+// Concurrent creation that consumes the last host P and dynamic GOMAXPROCS
+// changes are unsupported. The capacity check detects current availability; it
+// does not reserve the host P against another bubble. One-P GC execution is
+// unsupported and fails closed. Use an external process watchdog for tests that
+// can fail to block or finish, and discard processes reported WorkerUnsafe.
+//
 // Each test should be entirely self-contained:
 // The following guidelines should apply to most tests:
 //

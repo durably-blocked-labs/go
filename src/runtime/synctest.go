@@ -10,6 +10,17 @@ import (
 	"unsafe"
 )
 
+// Runtime pauses retain the current application continuation. These values
+// also appear as tags on experimental continuation observations.
+const (
+	bubbleContinuationSTW        uint8 = 1
+	bubbleContinuationScan       uint8 = 2
+	bubbleContinuationPreempt    uint8 = 3
+	bubbleContinuationGCYield    uint8 = 4
+	bubbleContinuationAssistDebt uint8 = 5
+	bubbleContinuationGCWait     uint8 = 6
+)
+
 // bubbleMaxDecisions is the maximum number of scheduling decisions
 // that can be recorded per bubble. Exceeding it fails closed.
 const bubbleMaxDecisions = 512
@@ -111,6 +122,15 @@ type synctestBubble struct {
 	decisionLen   int32 // decisions recorded so far (= step counter)
 	decisionFence int32 // pre-loaded decisions boundary (0 = no pre-load)
 	strictReplay  bool
+
+	// Optional experimental diagnostics, separate from replay decisions.
+	observations atomic.Pointer[bubbleObservations]
+
+	// Owner-P continuation across runtime preemption or collector stack scan.
+	// These pauses do not select an application peer. Owner P only.
+	runtimeResume       guintptr
+	runtimeResumeKind   uint8 // bubbleContinuation*
+	runtimeResumeReason uint8
 
 	// Foreign producers enqueue under mu; only the owner P drains into runq.
 	inbound gQueue

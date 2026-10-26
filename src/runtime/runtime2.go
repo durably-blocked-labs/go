@@ -584,6 +584,7 @@ type g struct {
 	bubbleReadyFinish bool            // nonparking callback needs cooperative registration
 	bubbleExternal    bool            // external wrapper active; nesting is rejected
 	bubbleHome        *synctestBubble // saved bubble during External (gp.bubble is nil while external)
+	bubbleGCInternal  bool            // scoped gcStart/gcAssistAlloc; never inherited by children
 
 	// xRegs stores the extended register state if this G has been
 	// asynchronously preempted.

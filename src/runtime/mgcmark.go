@@ -303,8 +303,11 @@ func markroot(gcw *gcWork, i uint32, flushBgCredit bool) int64 {
 			if gp.gcscandone {
 				throw("g already scanned")
 			}
+			// Experimental diagnostic only: stack ownership is held until resumeG.
+			ob := bubbleObserveGCScan(gp, stopped.stopped, selfScan, status)
 			workDone += scanstack(gp, gcw)
 			gp.gcscandone = true
+			bubbleObserveGCResume(gp, ob, stopped.stopped, selfScan, status)
 			resumeG(stopped)
 
 			if selfScan {
@@ -506,19 +509,18 @@ func gcAssistAlloc(gp *g) {
 		return
 	}
 
-	if gp := getg(); gp.bubble != nil {
-		// Disassociate the G from its synctest bubble while allocating.
-		// This is less elegant than incrementing the group's active count,
-		// but avoids any contamination between GC assist and synctest.
-		bubble := gp.bubble
-		home := gp.bubbleHome
-		// Keep scheduler ownership while disassociated for GC accounting:
-		// assists can yield or park and must resume on the bubble's P.
-		gp.bubbleHome = bubble
+	if gp := getg(); gp.bubble != nil || gp.bubbleHome != nil {
+		bubbleRequireHostP()
+		bubble, home, internal := gp.bubble, gp.bubbleHome, gp.bubbleGCInternal
+		if bubble != nil {
+			gp.bubbleHome = bubble
+		}
+		gp.bubbleGCInternal = true
 		gp.bubble = nil
 		defer func() {
 			gp.bubble = bubble
 			gp.bubbleHome = home
+			gp.bubbleGCInternal = internal
 		}()
 	}
 

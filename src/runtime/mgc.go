@@ -743,14 +743,18 @@ func gcStart(trigger gcTrigger) {
 	releasem(mp)
 	mp = nil
 
-	if gp := getg(); gp.bubble != nil {
-		// Disassociate the G from its synctest bubble while allocating.
-		// This is less elegant than incrementing the group's active count,
-		// but avoids any contamination between GC and synctest.
-		bubble := gp.bubble
+	if gp := getg(); gp.bubble != nil || gp.bubbleHome != nil {
+		bubbleRequireHostP()
+		bubble, home, internal := gp.bubble, gp.bubbleHome, gp.bubbleGCInternal
+		if bubble != nil {
+			gp.bubbleHome = bubble
+		}
+		gp.bubbleGCInternal = true
 		gp.bubble = nil
 		defer func() {
 			gp.bubble = bubble
+			gp.bubbleHome = home
+			gp.bubbleGCInternal = internal
 		}()
 	}
 

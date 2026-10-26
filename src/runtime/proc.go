@@ -762,6 +762,7 @@ func bubblePreSnapshot(pp *p, b *synctestBubble) {
 	if b == nil || b.decisions == nil || b.decisionLen >= bubbleMaxDecisions {
 		return
 	}
+	bubbleObserveControl(pp, b, bubbleControlBeforeSchedule)
 	d := &b.decisions[b.decisionLen]
 	pos := int32(0)
 	if next := pp.runnext; next != 0 {
@@ -798,6 +799,10 @@ func bubbleFinishRecord(b *synctestBubble, gp *g, idx int32) {
 	d.chosenSpawnPC = gp.bubbleSpawnPC
 	b.lastScheduledBgid = gp.bubbleGid
 	b.decisionLen = n + 1
+	if ob := b.observationBuffer(); ob != nil {
+		ob.nativeStep.Store(n)
+		b.recordObservation(bubbleObservation{Kind: bubbleObservationSchedule, BGID: gp.bubbleGid, NativeStep: n, PC: gp.bubbleSpawnPC})
+	}
 }
 
 func bubbleReplayDiverged(b *synctestBubble, idx int32, reason uint8) (*g, bool, bool) {
@@ -1831,6 +1836,7 @@ func stopTheWorldWithSema(reason stwReason) worldStop {
 	lock(&sched.lock)
 	start := nanotime() // exclude time waiting for sched.lock from start and total time metrics.
 	sched.stopwait = gomaxprocs
+	bubbleDiagnosticSTWReason.Store(uint32(reason))
 	sched.gcwaiting.Store(true)
 	preemptall()
 
@@ -3525,6 +3531,10 @@ func gcstopm() {
 func execute(gp *g, inheritTime bool) {
 	mp := getg().m
 
+	if owner := mp.p.ptr().bubble; owner != nil && gp != owner.root && gp.bubble != owner && gp.bubbleHome != owner {
+		throw("synctest: foreign goroutine executed on bubble P")
+	}
+
 	b := gp.bubble
 	if b == nil {
 		b = gp.bubbleHome
@@ -3593,6 +3603,70 @@ func execute(gp *g, inheritTime bool) {
 // Tries to steal from other P's, get g from local or global queue, poll network.
 // tryWakeP indicates that the returned goroutine is not normal (GC worker, trace
 // reader) so the caller should try to wake a P.
+// bubbleServiceGC makes owner-local marking work available to eligible host
+// processors. Bubble Ps cannot rely on running a background worker themselves.
+// Called on g0 with the owner P, after STW and per-P safe-point requests.
+func bubbleServiceGC(pp *p) {
+	if gcBlackenEnabled == 0 {
+		return
+	}
+	bubbleRequireHostP()
+	gcController.releaseNextGCMarkWorker(pp)
+	if !pp.wbBuf.empty() {
+		wbBufFlush1(pp)
+	}
+	if !pp.gcw.empty() {
+		pp.gcw.dispose()
+	}
+	if gcMarkWorkAvailable() {
+		bubbleWakeHost()
+	}
+}
+
+// GC on bubble-owned Ps requires at least one processor eligible for host and
+// collector goroutines. Fail closed instead of reserving every P indefinitely.
+func bubbleRequireHostP() {
+	for _, candidate := range allp {
+		lock(&candidate.bubbleStealMu)
+		host := candidate.bubble == nil && candidate.status != _Pdead
+		unlock(&candidate.bubbleStealMu)
+		if host {
+			return
+		}
+	}
+	throw("synctest: GC requires a spare non-bubble P")
+}
+
+func bubbleWakeHost() { wakep() }
+
+// Owner-P only. Do not hold b.mu while waiting for a runtime interruption.
+func bubbleDrainInbound(pp *p, b *synctestBubble) {
+	lock(&b.mu)
+	q := b.inbound
+	b.inbound = gQueue{}
+	unlock(&b.mu)
+	for !q.empty() {
+		gp := q.pop()
+		runqput(pp, gp, gp == b.hookG && b.rootInHook)
+	}
+}
+
+func bubbleReserveContinuation(pp *p, gp *g, kind uint8) {
+	b := pp.bubble
+	if b == nil || (gp != b.root && gp.bubble != b && gp.bubbleHome != b) {
+		return
+	}
+	if b.runtimeResume != 0 && b.runtimeResume.ptr() != gp {
+		throw("synctest: overlapping runtime continuations")
+	}
+	b.runtimeResume.set(gp)
+	b.runtimeResumeKind = kind
+	b.runtimeResumeReason = 0
+	if kind == bubbleContinuationSTW {
+		b.runtimeResumeReason = uint8(bubbleDiagnosticSTWReason.Load())
+	}
+}
+
 func findRunnable() (gp *g, inheritTime, tryWakeP bool) {
 	mp := getg().m
 
@@ -3608,11 +3682,46 @@ top:
 
 	pp := mp.p.ptr()
 	if sched.gcwaiting.Load() {
+		b := pp.bubble
+		bubbleObserveWorldStop(b, bubbleObservationWorldStopWait)
 		gcstopm()
+		bubbleObserveWorldStop(b, bubbleObservationWorldStopResumed)
 		goto top
 	}
 	if pp.runSafePointFn != 0 {
 		runSafePointFn()
+	}
+	if pp.bubble != nil {
+		bubbleServiceGC(pp)
+	}
+
+	// Runtime interruptions preserve the exact interrupted continuation. A
+	// scanner may still own its stack: service runtime safe points above,
+	// receive cross-P wakeups here, and wait without running an application
+	// peer. A spare host P must remain available for collector progress.
+	if b := pp.bubble; b != nil && b.runtimeResume != 0 {
+		bubbleDrainInbound(pp, b)
+		target := b.runtimeResume.ptr()
+		gp, _ := bubbleTakeControl(pp, target)
+		if gp == nil {
+			if b.runtimeResumeKind != bubbleContinuationScan && b.runtimeResumeKind != bubbleContinuationAssistDebt && b.runtimeResumeKind != bubbleContinuationGCWait {
+				throw("synctest: runtime continuation missing from owner queue")
+			}
+			osyield()
+			goto top
+		}
+		kind := b.runtimeResumeKind
+		b.runtimeResume = 0
+		b.runtimeResumeKind = 0
+		if ob := b.observationBuffer(); ob != nil {
+			eventKind := bubbleObservationRuntimeContinued
+			if kind == bubbleContinuationSTW {
+				eventKind = bubbleObservationWorldStopContinued
+			}
+			b.recordObservation(bubbleObservation{Kind: eventKind, Tag: uint32(kind), BGID: gp.bubbleGid, NativeStep: ob.nativeStep.Load(), STWReason: b.runtimeResumeReason})
+		}
+		b.runtimeResumeReason = 0
+		return gp, true, false
 	}
 
 	// now and pollUntil are saved for work stealing later,
@@ -3680,14 +3789,7 @@ top:
 	// Drain foreign wakeups on the owner P only. Root has priority while
 	// suspended in a hook; other goroutines remain queued, not executed.
 	if b := pp.bubble; b != nil {
-		lock(&b.mu)
-		q := b.inbound
-		b.inbound = gQueue{}
-		unlock(&b.mu)
-		for !q.empty() {
-			gp := q.pop()
-			runqput(pp, gp, gp == b.hookG && b.rootInHook)
-		}
+		bubbleDrainInbound(pp, b)
 		if b.rootInHook {
 			if gp, inherit := bubbleTakeControl(pp, b.hookG); gp != nil {
 				return gp, inherit, false
@@ -3772,6 +3874,7 @@ top:
 		// the hook eventually and set decisionReady.
 		if readgstatus(b.root)&^_Gscan == _Gwaiting {
 			// Snapshot runq for root to inspect.
+			bubbleObserveControl(pp, b, bubbleControlBeforeFrontier)
 			pos := int32(0)
 			if next := pp.runnext; next != 0 {
 				gp := next.ptr()
@@ -3839,6 +3942,13 @@ top:
 	// thousands of short waits, which otherwise burns CPU without helping the
 	// wakeup arrive any sooner.
 	if b := pp.bubble; b != nil && (b.external > 0 || b.externalWait > 0) && runqempty(pp) {
+		osyield()
+		goto top
+	}
+
+	// A bubble-owned P never runs unrelated host, netpoll, or GC-worker Gs.
+	// Keep servicing safe points and inbound work through the top of the loop.
+	if pp.bubble != nil {
 		osyield()
 		goto top
 	}
@@ -4521,7 +4631,7 @@ func injectglist(glist *gList) {
 	}
 
 	pp := getg().m.p.ptr()
-	if pp == nil {
+	if pp == nil || pp.bubble != nil {
 		n := q.size
 		lock(&sched.lock)
 		globrunqputbatch(&q)
@@ -4706,6 +4816,15 @@ func park_m(gp *g) {
 		// transition anymore.
 		trace.GoPark(mp.waitTraceBlockReason, mp.waitTraceSkip)
 	}
+	if gp.bubbleGCInternal {
+		kind, tag := bubbleContinuationGCWait, bubbleGCPauseWait
+		if gp.waitreason == waitReasonGCAssistWait {
+			kind, tag = bubbleContinuationAssistDebt, bubbleGCPauseAssistDebt
+		}
+		bubbleObserveGCPause(gp, tag)
+		bubbleReserveContinuation(mp.p.ptr(), gp, kind)
+	}
+
 	// N.B. Not using casGToWaiting here because the waitreason is
 	// set by park_m's caller.
 	casgstatus(gp, _Grunning, _Gwaiting)
@@ -4729,6 +4848,13 @@ func park_m(gp *g) {
 				trace.GoUnpark(gp, 2)
 				traceRelease(trace)
 			}
+			// A rejected park continues directly; no pending wait remains.
+			if b := mp.p.ptr().bubble; b != nil && b.runtimeResume.ptr() == gp {
+				b.runtimeResume = 0
+				b.runtimeResumeKind = 0
+				b.runtimeResumeReason = 0
+			}
+
 			execute(gp, true) // Schedule it back, never returns.
 		}
 	}
@@ -4758,6 +4884,17 @@ func goschedImpl(gp *g, preempted bool) {
 			trace.GoSched()
 		}
 	}
+	if preempted {
+		kind := bubbleContinuationPreempt
+		if sched.gcwaiting.Load() {
+			kind = bubbleContinuationSTW
+		}
+		bubbleReserveContinuation(pp, gp, kind)
+	} else if gp.bubbleGCInternal {
+		bubbleObserveGCPause(gp, bubbleGCPauseYield)
+		bubbleReserveContinuation(pp, gp, bubbleContinuationGCYield)
+	}
+
 	casgstatus(gp, _Grunning, _Grunnable)
 	if trace.ok() {
 		traceRelease(trace)
@@ -4817,6 +4954,7 @@ func goschedguarded_m(gp *g) {
 }
 
 func gopreempt_m(gp *g) {
+	bubbleObservePreempt(gp)
 	goschedImpl(gp, true)
 }
 
@@ -4850,6 +4988,7 @@ func preemptPark(gp *g) {
 	// something could claim this G before we've fully cleaned it
 	// up. Hence, we set the scan bit to lock down further
 	// transitions until we can dropg.
+	bubbleReserveContinuation(getg().m.p.ptr(), gp, bubbleContinuationScan)
 	casGToPreemptScan(gp, _Grunning, _Gscan|_Gpreempted)
 
 	// Be careful about ownership as we trace this next event.
@@ -4880,6 +5019,7 @@ func preemptPark(gp *g) {
 	// Drop the goroutine from the M. Only do this after the tracer has
 	// emitted an event, because it needs the association for GoPark to
 	// work correctly.
+	bubbleObservePreemptPark(gp)
 	dropg()
 
 	// Drop the scan bit and release the trace locker if necessary.
@@ -5845,6 +5985,7 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 	newg.ancestors = saveAncestors(callergp)
 	newg.startpc = fn.fn
 	newg.runningCleanups.Store(false)
+	newg.bubbleGCInternal = false
 	if isSystemGoroutine(newg, false) {
 		sched.ngsys.Add(1)
 	} else {
